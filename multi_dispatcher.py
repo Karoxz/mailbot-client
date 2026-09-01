@@ -942,7 +942,9 @@ def multi_dispatcher_loop(poll_seconds: float,
                     _m.LOAD_STORE[order] = result["load_data"]
                     _m.LOAD_STORE[order]["original_msg_full"] = full
 
-            if formatted:
+            if formatted and not order:
+                _log(f"[{ts}] ⚠ formatted result missing order_id{gmid_tag} — cannot route")
+            elif formatted:
                 _log(f"[{ts}] ✅ #{order}{gmid_tag} → routing to dispatcher")
                 # ── KEY DIFFERENCE: use notify_load instead of send_to_telegram
                 notify_load(
