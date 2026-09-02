@@ -152,12 +152,18 @@ def call_get_thread_learning_status(license_key, machine_id) -> dict:
     return {}
 
 def call_backfill_thread(license_key, machine_id, thread_id, order_id, messages: list) -> dict:
+    # The server makes up to ~2 throttled Gemini calls per message (rate
+    # extraction, plus reply classification per broker turn), each paced
+    # at ~4.5s with a possible 10s 429-retry — a flat 30s timeout was
+    # routinely too short for any thread with more than a couple of
+    # messages. Scale with message count instead, capped at 5 minutes.
+    backfill_timeout = min(300, 20 + len(messages) * 12)
     try:
         r = _session.post(
             f"{SERVER_URL}/api/backfill_thread",
             json={"license_key": license_key, "machine_id": machine_id,
                   "thread_id": thread_id, "order_id": order_id, "messages": messages},
-            timeout=30,   # LLM calls per message — give this more headroom than other calls
+            timeout=backfill_timeout,
         )
         if r.status_code == 200:
             return r.json()
