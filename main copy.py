@@ -989,13 +989,33 @@ def run_thread_learning_backfill(days_back: int = 45) -> dict:
         label_map = get_label_map(gmail_service)
 
         after_ts = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp())
-        query = (f'(label:bid OR label:"Finished Loads" OR label:BROKERS '
-                 f'OR label:RC OR label:"in route") after:{after_ts}')
 
-        results = gmail_service.users().threads().list(
-            userId="me", q=query, maxResults=200
-        ).execute()
-        thread_ids = [t["id"] for t in results.get("threads", [])]
+        # Query each label separately (own maxResults cap) rather than
+        # one combined OR query. A shared query returns Gmail's newest
+        # N threads across ALL matched labels together — "bid"
+        # (Sylectus auto-notifications) is far higher volume than the
+        # rest, and was crowding rarer-but-more-valuable labels like
+        # RC out of the capped result set entirely, not just pushing
+        # them later in the batch. Confirmed 2026-09-02: only 1 of 5
+        # real RC-labeled threads in a 30-day window ever made it into
+        # a combined-query run.
+        BACKFILL_LABELS = ["bid", "Finished Loads", "BROKERS", "RC", "in route"]
+        per_label_counts = {}
+        thread_ids_seen = set()
+        thread_ids = []
+        for label in BACKFILL_LABELS:
+            label_q = f'label:"{label}"' if " " in label else f"label:{label}"
+            results = gmail_service.users().threads().list(
+                userId="me", q=f"{label_q} after:{after_ts}", maxResults=200
+            ).execute()
+            found = [t["id"] for t in results.get("threads", [])]
+            per_label_counts[label] = len(found)
+            for tid in found:
+                if tid not in thread_ids_seen:
+                    thread_ids_seen.add(tid)
+                    thread_ids.append(tid)
+        print(f"[BACKFILL] per-label thread counts: {per_label_counts}, "
+              f"{len(thread_ids)} unique threads total")
 
         processed, skipped, errors = 0, 0, 0
         for tid in thread_ids:
@@ -1028,7 +1048,8 @@ def run_thread_learning_backfill(days_back: int = 45) -> dict:
                 errors += 1
 
         return {"total": len(thread_ids), "processed": processed,
-                "skipped": skipped, "errors": errors}
+                "skipped": skipped, "errors": errors,
+                "per_label_counts": per_label_counts}
     except Exception as e:
         print(f"[BACKFILL] run failed: {e}")
         return {"error": str(e)}
