@@ -151,6 +151,37 @@ def call_get_thread_learning_status(license_key, machine_id) -> dict:
         print(f"call_get_thread_learning_status error: {e}")
     return {}
 
+def call_set_telegram_enabled(license_key, machine_id, enabled: bool) -> dict:
+    endpoint = "enable" if enabled else "disable"
+    try:
+        r = _session.post(
+            f"{SERVER_URL}/api/telegram/{endpoint}",
+            json={"license_key": license_key, "machine_id": machine_id},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            return r.json()
+        print(f"call_set_telegram_enabled HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"call_set_telegram_enabled error: {e}")
+    return {}
+
+
+def call_get_telegram_status(license_key, machine_id) -> dict:
+    try:
+        r = _session.post(
+            f"{SERVER_URL}/api/telegram/status",
+            json={"license_key": license_key, "machine_id": machine_id},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            return r.json()
+        print(f"call_get_telegram_status HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"call_get_telegram_status error: {e}")
+    return {}
+
+
 def call_backfill_thread(license_key, machine_id, thread_id, order_id, messages: list) -> dict:
     # The server makes up to ~2 throttled Gemini calls per message (rate
     # extraction, plus reply classification per broker turn), each paced

@@ -7,7 +7,8 @@ os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from api_client import (call_parse, call_build_bid, call_poll_push,
                          call_set_thread_learning, call_get_thread_learning_status,
-                         call_backfill_thread)
+                         call_backfill_thread,
+                         call_set_telegram_enabled, call_get_telegram_status)
 
 import sys
 import io
@@ -189,6 +190,18 @@ TELEGRAM_OFFSET_LOCK   = threading.Lock()
 
 CHAT_IDS: list = [0000]
 _CHAT_IDS_LOCK = threading.Lock()
+
+# Cached "should we actually send to Telegram right now" flag — checked
+# by every real send call site (_telegram_send_one, _prompt_for_bid_rate),
+# refreshed on launch and via the header toggle button, never by hitting
+# the server on every single message (too slow, too much load for
+# something that rarely changes). Defaults True: fails OPEN on a network
+# hiccup or before the first refresh completes — a dispatcher missing a
+# real load notification because of a transient status-check failure
+# would be worse than the rare case of one extra message sent while
+# toggling off. Only an explicit, successful "disabled" response ever
+# sets this False.
+_TELEGRAM_ENABLED = True
 
 # Find the EXE's real directory
 
@@ -410,6 +423,10 @@ def _retrieve_url(key: str) -> str:
 # =============================================================
 
 def _telegram_send_one(chat_id: int, payload: dict):
+    if not _TELEGRAM_ENABLED:
+        print(f"[TELEGRAM] suppressed (toggle off) -> chat {chat_id}: "
+              f"{(payload.get('text') or '')[:80]!r}")
+        return
     url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     body = dict(payload)
     body["chat_id"] = chat_id
@@ -923,7 +940,14 @@ def _prompt_for_bid_rate(order_id: str, bid_id: int):
     the (chat_id, prompt_msg_id) -> bid_id mapping so the reply can be
     matched back and forwarded to /api/update_bid_amount. Mirrors the
     pattern driver_bot.py already uses for driver-entered rates.
+
+    Bypasses _telegram_send_one (needs the returned message_id, which
+    that helper doesn't hand back) so it needs its own _TELEGRAM_ENABLED
+    check rather than inheriting one from a shared choke point.
     """
+    if not _TELEGRAM_ENABLED:
+        print(f"[TELEGRAM] suppressed rate-prompt (toggle off) for bid_id={bid_id}")
+        return
     payload = {
         "text": f"💰 Order #{order_id} — what rate did you quote?\nReply with a number, e.g. 1400",
         "reply_markup": json.dumps({"force_reply": True, "selective": True}),
@@ -2158,6 +2182,77 @@ def create_app():
             _refresh_learning_btn()
         root.after(0, _apply)
     threading.Thread(target=_load_learning_status, daemon=True).start()
+
+    # ── Telegram on/off toggle — same UI pattern as Learning above, but
+    # opposite default and it drives the actual _TELEGRAM_ENABLED global
+    # that _telegram_send_one/_prompt_for_bid_rate check on every real
+    # send, not just its own button label. Starts ON (matches the
+    # server column's default and _TELEGRAM_ENABLED's own fail-open
+    # default) so the button never flashes a misleading OFF during the
+    # brief window before the async status check below completes.
+    telegram_btn_var = tk.StringVar(value="✈️  Telegram: ON")
+    telegram_btn_enabled = {"state": True}
+
+    def _refresh_telegram_btn():
+        color = _C["accent"] if telegram_btn_enabled["state"] else _C["input"]
+        label = "✈️  Telegram: ON" if telegram_btn_enabled["state"] else "✈️  Telegram: OFF"
+        telegram_btn_var.set(label)
+        telegram_btn.configure(bg=color)
+
+    def _toggle_telegram():
+        global _TELEGRAM_ENABLED
+        new_state = not telegram_btn_enabled["state"]
+        telegram_btn.configure(state="disabled")
+        def _do():
+            result = call_set_telegram_enabled(ACTIVE_LICENSE_KEY, _get_machine_id(), new_state)
+            def _apply():
+                global _TELEGRAM_ENABLED
+                if result and result.get("success"):
+                    telegram_btn_enabled["state"] = result.get("enabled", new_state)
+                    _TELEGRAM_ENABLED = telegram_btn_enabled["state"]
+                    _refresh_telegram_btn()
+                else:
+                    messagebox.showerror("Telegram toggle",
+                                          "Couldn't reach the server to change this setting. Try again.")
+                telegram_btn.configure(state="normal")
+            root.after(0, _apply)
+        threading.Thread(target=_do, daemon=True).start()
+
+    telegram_btn = tk.Button(
+        hdr_right, textvariable=telegram_btn_var,
+        bg=_C["accent"], fg=_C["text"],
+        activebackground=_C["border"], activeforeground=_C["text"],
+        relief="flat", bd=0, padx=10, pady=5,
+        font=("Segoe UI", 8), cursor="hand2",
+        command=_toggle_telegram,
+    )
+    telegram_btn.pack(side="top", anchor="e", pady=(4, 0))
+
+    def _load_telegram_status():
+        global _TELEGRAM_ENABLED
+        result = call_get_telegram_status(ACTIVE_LICENSE_KEY, _get_machine_id())
+        def _apply():
+            global _TELEGRAM_ENABLED
+            # Fail open on a failed/empty response — a status-check
+            # hiccup should never silently mute real notifications, so
+            # only an explicit result flips this away from the True
+            # default set at module load.
+            if result and "enabled" in result:
+                telegram_btn_enabled["state"] = bool(result.get("enabled"))
+                _TELEGRAM_ENABLED = telegram_btn_enabled["state"]
+                _refresh_telegram_btn()
+        root.after(0, _apply)
+    threading.Thread(target=_load_telegram_status, daemon=True).start()
+
+    # Periodic re-check, not just on launch — otherwise toggling this
+    # from the web dashboard while the desktop is already running would
+    # silently do nothing until the next restart. 5 minutes: frequent
+    # enough that a web-side toggle takes effect promptly, infrequent
+    # enough to not matter as server load for something that rarely changes.
+    def _periodic_telegram_refresh():
+        threading.Thread(target=_load_telegram_status, daemon=True).start()
+        root.after(5 * 60 * 1000, _periodic_telegram_refresh)
+    root.after(5 * 60 * 1000, _periodic_telegram_refresh)
 
     # ── Manual backfill trigger — only meaningful once learning is ON;
     # the server re-checks the flag itself regardless, so this is safe
