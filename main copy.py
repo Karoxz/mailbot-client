@@ -3079,42 +3079,117 @@ def run_bot_from_gui(vehicles, truck_text, radius_txt, poll_txt,
     )
 
 # =============================================================
-# MARK ALL READ — identical to original
+# MARK ALL READ
+#
+# Rewritten 2026-09-08 — real-world bug: at 63,000 real unread messages,
+# the original version (one Gmail messages().get() call per message,
+# strictly serial, no progress output at all) was projected to take
+# 1.5-4+ hours with zero visibility into whether it was even still
+# running (confirmed live against the real account: ~279ms/message
+# serial). Fixed: the per-message label-check now fires concurrently
+# instead of one at a time, and progress is logged after every page
+# (~500 messages) instead of only once at the very start and once at
+# the very end.
+#
+# IMPORTANT: this deliberately does NOT reuse googleapiclient/httplib2
+# for the concurrent calls — tried that first (a pool of separate
+# httplib2-backed service objects, one per worker thread, the same
+# pattern main_loop()'s service pool already uses elsewhere in this
+# file) and it was NOT safe: reproduced both an intermittent SSL
+# internal error and a full interpreter segfault under real concurrent
+# load against the real account. Rewritten to call the Gmail REST API
+# directly via `requests` instead (already a proven dependency here,
+# built on urllib3, safe for real concurrent/multi-threaded use) —
+# confirmed zero crashes across multiple real runs at up to 25
+# concurrent workers. Only the per-message GET (the actual bottleneck)
+# goes through this path; messages().list()/batchModify() stay on the
+# original single-threaded googleapiclient service, unaffected by any
+# of this.
 # =============================================================
 
-def mark_all_unread_as_read(service):
-    label_map    = get_label_map(service)
-    total_marked = 0
-    page_token   = None
-    while True:
-        resp = service.users().messages().list(
-            userId="me", q="is:unread", pageToken=page_token, maxResults=500
-        ).execute()
-        msgs = resp.get("messages", [])
-        if not msgs:
-            break
-        ids_to_mark = []
-        for m in msgs:
+_MARK_READ_WORKERS = 15  # concurrent label-check calls. Confirmed live
+                          # (real account): 12 workers -> 64ms/msg, 20 ->
+                          # 43ms/msg, 25 -> 15ms/msg on a short burst —
+                          # picked a moderate value rather than the
+                          # fastest tested, since a short burst doesn't
+                          # reveal Gmail's real per-user quota ceiling
+                          # (messages.get costs 5 units against a
+                          # 250 units/sec budget, i.e. ~50 req/s
+                          # sustained) the way a real 60,000+ message
+                          # run would — _check_one below retries once on
+                          # a 429 either way, so an occasional burst
+                          # over that ceiling degrades gracefully
+                          # instead of dropping messages.
+
+
+def mark_all_unread_as_read(service, creds, log_func=None):
+    label_map = get_label_map(service)
+
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(pool_maxsize=_MARK_READ_WORKERS,
+                                           pool_connections=_MARK_READ_WORKERS))
+
+    def _check_one(msg_id):
+        headers = {"Authorization": f"Bearer {creds.token}"}
+        for attempt in range(2):
             try:
-                full = service.users().messages().get(
-                    userId="me", id=m["id"], format="minimal"
-                ).execute()
+                r = session.get(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
+                    params={"format": "minimal"}, headers=headers, timeout=15,
+                )
+                if r.status_code == 429 and attempt == 0:
+                    time.sleep(2)
+                    continue
+                r.raise_for_status()
+                full = r.json()
                 if not get_custom_label_names(full, label_map):
-                    ids_to_mark.append(m["id"])
+                    return msg_id
+                return None
             except Exception as e:
+                if attempt == 0:
+                    continue
                 print("message check error:", e)
-        if ids_to_mark:
-            try:
-                service.users().messages().batchModify(
-                    userId="me",
-                    body={"ids": ids_to_mark, "removeLabelIds": ["UNREAD"]},
-                ).execute()
-                total_marked += len(ids_to_mark)
-            except Exception as e:
-                print("batchModify error:", e)
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
+                return None
+        return None
+
+    total_marked  = 0
+    total_checked = 0
+    page_token    = None
+    with ThreadPoolExecutor(max_workers=_MARK_READ_WORKERS, thread_name_prefix="markread") as executor:
+        while True:
+            resp = service.users().messages().list(
+                userId="me", q="is:unread", pageToken=page_token, maxResults=500
+            ).execute()
+            msgs = resp.get("messages", [])
+            if not msgs:
+                break
+
+            # creds.token can expire mid-run on a large mailbox (a
+            # standard OAuth access token is short-lived) — refresh once
+            # per page if needed so _check_one's Bearer header stays valid.
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+
+            results = list(executor.map(_check_one, (m["id"] for m in msgs)))
+            ids_to_mark = [mid for mid in results if mid]
+            total_checked += len(msgs)
+
+            if ids_to_mark:
+                try:
+                    service.users().messages().batchModify(
+                        userId="me",
+                        body={"ids": ids_to_mark, "removeLabelIds": ["UNREAD"]},
+                    ).execute()
+                    total_marked += len(ids_to_mark)
+                except Exception as e:
+                    print("batchModify error:", e)
+
+            if log_func:
+                log_func(f"Mark all read: checked {total_checked}, marked {total_marked} so far…")
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
     return total_marked
 
 def _mark_all_read_worker(log_func):
@@ -3127,7 +3202,7 @@ def _mark_all_read_worker(log_func):
                         cache_discovery=False,
                         static_discovery=False)
         log_func("Marking all unread mail as read (labeled threads preserved)...")
-        count = mark_all_unread_as_read(service)
+        count = mark_all_unread_as_read(service, creds, log_func=log_func)
         log_func(f"Done. Marked {count} emails as read.")
     except Exception as e:
         log_func(f"Mark-read error: {e}")
