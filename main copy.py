@@ -8,7 +8,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from api_client import (call_parse, call_build_bid, call_poll_push,
                          call_set_thread_learning, call_get_thread_learning_status,
                          call_backfill_thread,
-                         call_set_telegram_enabled, call_get_telegram_status)
+                         call_get_telegram_status)
 
 import sys
 import io
@@ -1004,7 +1004,8 @@ def run_thread_learning_backfill(days_back: int = 45) -> dict:
         http.disable_ssl_certificate_validation = True
         gmail_service = build("gmail", "v1",
                               http=AuthorizedHttp(creds, http),
-                              cache_discovery=False)
+                              cache_discovery=False,
+                              static_discovery=False)
 
         my_email = gmail_service.users().getProfile(userId="me").execute().get("emailAddress", "")
         # Gmail's raw labelIds are opaque tokens for custom labels (e.g.
@@ -2183,51 +2184,14 @@ def create_app():
         root.after(0, _apply)
     threading.Thread(target=_load_learning_status, daemon=True).start()
 
-    # ── Telegram on/off toggle — same UI pattern as Learning above, but
-    # opposite default and it drives the actual _TELEGRAM_ENABLED global
-    # that _telegram_send_one/_prompt_for_bid_rate check on every real
-    # send, not just its own button label. Starts ON (matches the
-    # server column's default and _TELEGRAM_ENABLED's own fail-open
-    # default) so the button never flashes a misleading OFF during the
-    # brief window before the async status check below completes.
-    telegram_btn_var = tk.StringVar(value="✈️  Telegram: ON")
-    telegram_btn_enabled = {"state": True}
-
-    def _refresh_telegram_btn():
-        color = _C["accent"] if telegram_btn_enabled["state"] else _C["input"]
-        label = "✈️  Telegram: ON" if telegram_btn_enabled["state"] else "✈️  Telegram: OFF"
-        telegram_btn_var.set(label)
-        telegram_btn.configure(bg=color)
-
-    def _toggle_telegram():
-        global _TELEGRAM_ENABLED
-        new_state = not telegram_btn_enabled["state"]
-        telegram_btn.configure(state="disabled")
-        def _do():
-            result = call_set_telegram_enabled(ACTIVE_LICENSE_KEY, _get_machine_id(), new_state)
-            def _apply():
-                global _TELEGRAM_ENABLED
-                if result and result.get("success"):
-                    telegram_btn_enabled["state"] = result.get("enabled", new_state)
-                    _TELEGRAM_ENABLED = telegram_btn_enabled["state"]
-                    _refresh_telegram_btn()
-                else:
-                    messagebox.showerror("Telegram toggle",
-                                          "Couldn't reach the server to change this setting. Try again.")
-                telegram_btn.configure(state="normal")
-            root.after(0, _apply)
-        threading.Thread(target=_do, daemon=True).start()
-
-    telegram_btn = tk.Button(
-        hdr_right, textvariable=telegram_btn_var,
-        bg=_C["accent"], fg=_C["text"],
-        activebackground=_C["border"], activeforeground=_C["text"],
-        relief="flat", bd=0, padx=10, pady=5,
-        font=("Segoe UI", 8), cursor="hand2",
-        command=_toggle_telegram,
-    )
-    telegram_btn.pack(side="top", anchor="e", pady=(4, 0))
-
+    # ── Telegram on/off — status-only, no button (button removed
+    # 2026-09-08 on request). The desktop still needs to KNOW and RESPECT
+    # this flag — it's the same telegram_enabled column the web
+    # dashboard's own Settings toggle controls, and _telegram_send_one/
+    # _prompt_for_bid_rate both gate on _TELEGRAM_ENABLED on every real
+    # send — so this keeps polling status in the background with no UI
+    # control of its own; toggling it now only happens from the web
+    # dashboard, not here.
     def _load_telegram_status():
         global _TELEGRAM_ENABLED
         result = call_get_telegram_status(ACTIVE_LICENSE_KEY, _get_machine_id())
@@ -2238,9 +2202,7 @@ def create_app():
             # only an explicit result flips this away from the True
             # default set at module load.
             if result and "enabled" in result:
-                telegram_btn_enabled["state"] = bool(result.get("enabled"))
-                _TELEGRAM_ENABLED = telegram_btn_enabled["state"]
-                _refresh_telegram_btn()
+                _TELEGRAM_ENABLED = bool(result.get("enabled"))
         root.after(0, _apply)
     threading.Thread(target=_load_telegram_status, daemon=True).start()
 
@@ -3162,7 +3124,8 @@ def _mark_all_read_worker(log_func):
         http.disable_ssl_certificate_validation = True
         service = build("gmail", "v1",
                         http=AuthorizedHttp(creds, http),
-                        cache_discovery=False)
+                        cache_discovery=False,
+                        static_discovery=False)
         log_func("Marking all unread mail as read (labeled threads preserved)...")
         count = mark_all_unread_as_read(service)
         log_func(f"Done. Marked {count} emails as read.")
