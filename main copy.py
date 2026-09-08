@@ -8,7 +8,7 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from api_client import (call_parse, call_build_bid, call_poll_push,
                          call_set_thread_learning, call_get_thread_learning_status,
                          call_backfill_thread,
-                         call_get_telegram_status)
+                         call_get_telegram_status, call_set_telegram_enabled)
 
 import sys
 import io
@@ -422,11 +422,20 @@ def _retrieve_url(key: str) -> str:
 # TELEGRAM — identical to original
 # =============================================================
 
-def _telegram_send_one(chat_id: int, payload: dict):
+def _telegram_send_one(chat_id: int, payload: dict) -> bool:
+    """Returns whether the send actually succeeded — 2026-09-08: the
+    caller in _process_email was logging "sent to Telegram" in the GUI
+    BEFORE this even ran, so a real failure here (bad chat ID, bot
+    never messaged first, network issue) was invisible — the GUI showed
+    success regardless, and the actual error only ever reached a bare
+    print(), which the compiled exe launched by double-click (no
+    attached console) has nowhere visible to send. Now returns a real
+    result AND writes any failure to the durable file log (_flog) so
+    it's diagnosable even without a console."""
     if not _TELEGRAM_ENABLED:
         print(f"[TELEGRAM] suppressed (toggle off) -> chat {chat_id}: "
               f"{(payload.get('text') or '')[:80]!r}")
-        return
+        return False
     url  = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     body = dict(payload)
     body["chat_id"] = chat_id
@@ -438,13 +447,24 @@ def _telegram_send_one(chat_id: int, payload: dict):
     try:
         r = session.post(url, json=body, timeout=5)
         if not r.ok:
-            print(f"Telegram send error (chat {chat_id}):", r.text[:200])
+            err = f"Telegram send error (chat {chat_id}): {r.text[:200]}"
+            print(err)
+            _flog("error", err)
+            return False
+        return True
     except Exception as e:
-        print(f"Telegram exception (chat {chat_id}):", e)
+        err = f"Telegram exception (chat {chat_id}): {e}"
+        print(err)
+        _flog("error", err)
+        return False
 
 def send_to_telegram(text, bid_order_id=None, mobile_thread_url=None,
                      reply_msg_id=None, open_url=None, open_url_text="OPEN GMAIL",
-                     route_url=None):
+                     route_url=None) -> bool:
+    """Returns True if the message reached at least one configured chat
+    (matches the old "fire and forget" behavior when there's only one
+    chat ID, which is the common case) — see _telegram_send_one's
+    docstring for why this now matters to the caller."""
     payload = {"text": text}
     if bid_order_id and mobile_thread_url:
         row1 = [
@@ -468,13 +488,18 @@ def send_to_telegram(text, bid_order_id=None, mobile_thread_url=None,
         ]]})
     with _CHAT_IDS_LOCK:
         ids = list(CHAT_IDS)
+    if not ids:
+        return False
     if len(ids) == 1:
-        _telegram_send_one(ids[0], payload)
+        return _telegram_send_one(ids[0], payload)
     else:
-        threads = [threading.Thread(target=_telegram_send_one,
-                                    args=(cid, payload), daemon=True) for cid in ids]
+        results = {}
+        def _run(cid):
+            results[cid] = _telegram_send_one(cid, payload)
+        threads = [threading.Thread(target=_run, args=(cid,), daemon=True) for cid in ids]
         for t in threads: t.start()
         for t in threads: t.join(timeout=6)
+        return any(results.values())
 
 def send_to_telegram_with_buttons(text: str, buttons: list):
     MAX_URL   = 2048
@@ -1639,15 +1664,21 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
             gmid_tag  = f" [gmid:{msg_id[-8:]}]"
 
             if formatted:
-                _log(f"[{ts}] ✅ #{order}{gmid_tag}  →  sent to Telegram")
                 _route_url = None
                 with LOAD_STORE_LOCK:
                     _ld = LOAD_STORE.get(order)
                     if _ld:
                         _route_url = _ld.get("route_url")
-                send_to_telegram(formatted, bid_order_id=order,
-                                 mobile_thread_url=mobile_bid_url,
-                                 route_url=_route_url)
+                _tg_ok = send_to_telegram(formatted, bid_order_id=order,
+                                          mobile_thread_url=mobile_bid_url,
+                                          route_url=_route_url)
+                if _tg_ok:
+                    _log(f"[{ts}] ✅ #{order}{gmid_tag}  →  sent to Telegram")
+                elif not _TELEGRAM_ENABLED:
+                    _log(f"[{ts}] ⏸ #{order}{gmid_tag}  →  Telegram is OFF, not sent")
+                else:
+                    _log(f"[{ts}] ❌ #{order}{gmid_tag}  →  Telegram send FAILED "
+                        f"(check chat ID / bot token — see log file for details)")
             else:
                 _log(f"[{ts}] ⏭  SKIPPED{order_tag}{gmid_tag}  →  {info}")
 
@@ -2989,6 +3020,30 @@ def create_app():
         _set_running(True)
         set_graphhopper_status("Server-side ✅")
         log("▶  Starting MailBot…")
+
+        # Pressing START means the dispatcher wants to actively run —
+        # Telegram notifications should just work, not stay silently
+        # suppressed because something else (the web dashboard's own
+        # Settings toggle, which shares this same flag) turned it off
+        # for an unrelated reason. Requested 2026-09-08, and plausibly
+        # the actual root cause of an earlier "log said sent, nothing
+        # arrived" report — if the flag was off, that send would have
+        # been silently suppressed with no error at all. Set locally
+        # first (takes effect immediately, this session), then persist
+        # server-side on a background thread (so it stays on across
+        # the periodic 5-minute re-check, and the web dashboard's
+        # Settings page reflects reality too) — never block START on
+        # the network round trip.
+        global _TELEGRAM_ENABLED
+        _TELEGRAM_ENABLED = True
+
+        def _enable_telegram_serverside():
+            result = call_set_telegram_enabled(ACTIVE_LICENSE_KEY, _get_machine_id(), True)
+            if not (result and result.get("success")):
+                log("⚠ Couldn't confirm Telegram enabled with the server — "
+                    "notifications will still send this session, but the "
+                    "toggle may not stay on long-term.")
+        threading.Thread(target=_enable_telegram_serverside, daemon=True).start()
         BOT_THREAD = threading.Thread(
             target=run_bot_from_gui,
             args=(v_ent.get(), t_box.get("1.0", "end"),
