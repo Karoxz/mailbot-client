@@ -3109,17 +3109,56 @@ def run_bot_from_gui(vehicles, truck_text, radius_txt, poll_txt,
 
 _MARK_READ_WORKERS = 15  # concurrent label-check calls. Confirmed live
                           # (real account): 12 workers -> 64ms/msg, 20 ->
-                          # 43ms/msg, 25 -> 15ms/msg on a short burst —
-                          # picked a moderate value rather than the
-                          # fastest tested, since a short burst doesn't
-                          # reveal Gmail's real per-user quota ceiling
-                          # (messages.get costs 5 units against a
-                          # 250 units/sec budget, i.e. ~50 req/s
-                          # sustained) the way a real 60,000+ message
-                          # run would — _check_one below retries once on
-                          # a 429 either way, so an occasional burst
-                          # over that ceiling degrades gracefully
-                          # instead of dropping messages.
+                          # 43ms/msg, 25 -> 15ms/msg on a short burst.
+                          # A real full run DOES hit Gmail's per-minute
+                          # quota eventually at this concurrency — confirmed
+                          # live 2026-09-08, ~12 minutes of sustained load
+                          # (29,500 of ~63,000 messages) before a real HTTP
+                          # 403 "rateLimitExceeded". Kept 15 rather than
+                          # dropping concurrency to avoid it entirely —
+                          # _gmail_execute_with_retry()/_check_one's own
+                          # retry now turn that into a ~65s pause-and-
+                          # continue instead of aborting the whole run, so
+                          # there's no real cost to occasionally hitting it.
+
+
+def _is_gmail_quota_error(status_code, body_text):
+    """Confirmed live in production (2026-09-08, a real 63k-message run):
+    Gmail's per-user-per-minute quota error surfaces as HTTP 403 with
+    reason 'rateLimitExceeded' — NOT 429 the way most APIs signal rate
+    limiting. Checking status alone isn't enough; this is the exact
+    shape that crashed the whole run when only 429 was handled."""
+    if status_code not in (403, 429):
+        return False
+    body_lower = (body_text or "").lower()
+    return status_code == 429 or any(s in body_lower for s in (
+        "ratelimitexceeded", "quotaexceeded", "userratelimitexceeded", "resource_exhausted",
+    ))
+
+
+def _gmail_execute_with_retry(fn, log_func=None, max_retries=4, wait_seconds=65):
+    """fn: a zero-arg callable performing one googleapiclient .execute()
+    call. This is Gmail's PER-MINUTE quota (confirmed by the error text
+    itself: "Previous quota: Units per minute per user") — a short retry
+    doesn't help, waiting out the window does. Applies to EVERY Gmail
+    call in mark_all_unread_as_read(), not just the concurrent per-
+    message checks — the actual production crash (2026-09-08, 29,500 of
+    ~63,000 messages in) came from the UNPROTECTED messages().list()
+    call, not the per-message GETs, which already had their own (also
+    incomplete — see _is_gmail_quota_error) retry."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            status = getattr(getattr(e, "resp", None), "status", None)
+            if _is_gmail_quota_error(status, str(e)) and attempt < max_retries - 1:
+                msg = f"Gmail quota hit — waiting {wait_seconds}s before retrying ({attempt + 1}/{max_retries})…"
+                print(msg)
+                if log_func:
+                    log_func(msg)
+                time.sleep(wait_seconds)
+                continue
+            raise
 
 
 def mark_all_unread_as_read(service, creds, log_func=None):
@@ -3131,14 +3170,14 @@ def mark_all_unread_as_read(service, creds, log_func=None):
 
     def _check_one(msg_id):
         headers = {"Authorization": f"Bearer {creds.token}"}
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 r = session.get(
                     f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}",
                     params={"format": "minimal"}, headers=headers, timeout=15,
                 )
-                if r.status_code == 429 and attempt == 0:
-                    time.sleep(2)
+                if _is_gmail_quota_error(r.status_code, r.text) and attempt < 2:
+                    time.sleep(65)
                     continue
                 r.raise_for_status()
                 full = r.json()
@@ -3146,7 +3185,8 @@ def mark_all_unread_as_read(service, creds, log_func=None):
                     return msg_id
                 return None
             except Exception as e:
-                if attempt == 0:
+                if attempt < 2:
+                    time.sleep(2)
                     continue
                 print("message check error:", e)
                 return None
@@ -3157,9 +3197,12 @@ def mark_all_unread_as_read(service, creds, log_func=None):
     page_token    = None
     with ThreadPoolExecutor(max_workers=_MARK_READ_WORKERS, thread_name_prefix="markread") as executor:
         while True:
-            resp = service.users().messages().list(
-                userId="me", q="is:unread", pageToken=page_token, maxResults=500
-            ).execute()
+            resp = _gmail_execute_with_retry(
+                lambda: service.users().messages().list(
+                    userId="me", q="is:unread", pageToken=page_token, maxResults=500
+                ).execute(),
+                log_func=log_func,
+            )
             msgs = resp.get("messages", [])
             if not msgs:
                 break
@@ -3176,10 +3219,13 @@ def mark_all_unread_as_read(service, creds, log_func=None):
 
             if ids_to_mark:
                 try:
-                    service.users().messages().batchModify(
-                        userId="me",
-                        body={"ids": ids_to_mark, "removeLabelIds": ["UNREAD"]},
-                    ).execute()
+                    _gmail_execute_with_retry(
+                        lambda: service.users().messages().batchModify(
+                            userId="me",
+                            body={"ids": ids_to_mark, "removeLabelIds": ["UNREAD"]},
+                        ).execute(),
+                        log_func=log_func,
+                    )
                     total_marked += len(ids_to_mark)
                 except Exception as e:
                     print("batchModify error:", e)
