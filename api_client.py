@@ -77,20 +77,6 @@ def call_record_bid(license_key, machine_id, bid_data: dict) -> dict:
     except Exception as e:
         print(f"call_record_bid error: {e}")
     return {}
-def call_update_bid_amount(license_key, machine_id, bid_id, bid_amount) -> dict: # type: ignore
-    try:
-        r = _session.post(
-            f"{SERVER_URL}/api/update_bid_amount",
-            json={"license_key": license_key, "machine_id": machine_id,
-                  "bid_id": bid_id, "bid_amount": bid_amount},
-            timeout=8,
-        )
-        if r.status_code == 200:
-            return r.json()
-        print(f"call_update_bid_amount HTTP {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"call_update_bid_amount error: {e}")
-    return {}
 def call_classify_reply(license_key, machine_id, thread_id, subject, message_body) -> dict:
     try:
         r = _session.post(
