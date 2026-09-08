@@ -1,4 +1,5 @@
 import requests, time
+from typing import Optional
 
 SERVER_URL = "http://178.105.208.7:8000"  # real server
 # SERVER_URL = "http://127.0.0.1:8000"  # test server
@@ -32,8 +33,6 @@ def call_parse(license_key, machine_id, email_body, internal_date_ms,
                 return None
             time.sleep(0.5)
     return None
-
-from typing import Optional
 
 def call_build_bid(license_key, machine_id, load_data) -> Optional[str]:
     try:

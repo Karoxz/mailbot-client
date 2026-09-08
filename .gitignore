@@ -9,6 +9,13 @@ nuitka-crash-report.xml
 __pycache__/
 *.pyc
 
+# Virtual environments — venv311 was the original dev env; build_venv is a
+# fresh one (2026-09-08) created for the Nuitka build after venv311's base
+# Python interpreter stopped existing on this machine. Neither is source.
+venv/
+venv311/
+build_venv/
+
 # Local secrets / credentials — never commit these
 credentials.json
 token.json
