@@ -69,7 +69,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 from activation_screen import run_activation_gate
-from api_client import call_parse, call_build_bid, call_record_bid, call_classify_reply, call_update_bid_amount
+from api_client import call_parse, call_build_bid, call_record_bid, call_classify_reply
 from license_manager import get_machine_id
 
 # Cache machine_id once — it never changes during a session
@@ -192,7 +192,7 @@ CHAT_IDS: list = [0000]
 _CHAT_IDS_LOCK = threading.Lock()
 
 # Cached "should we actually send to Telegram right now" flag — checked
-# by every real send call site (_telegram_send_one, _prompt_for_bid_rate),
+# by every real send call site (_telegram_send_one and friends),
 # refreshed on launch and via the header toggle button, never by hitting
 # the server on every single message (too slow, too much load for
 # something that rarely changes). Defaults True: fails OPEN on a network
@@ -922,9 +922,10 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
     this always runs after the real send/copy/draft has already
     happened, and any error here is swallowed and logged only.
 
-    Returns the new bid_id (or None on failure) so the caller can
-    prompt for the rate afterward and fill it in via
-    call_update_bid_amount once the dispatcher types it.
+    Returns the new bid_id (or None on failure). bid_amount starts out
+    unset — it's filled in automatically afterward by the periodic
+    thread-learning backfill (reads it straight from the dispatcher's
+    own reply in the "bid"-labeled Gmail thread), not typed in here.
     """
     driver = truck if truck else load
     try:
@@ -952,62 +953,18 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
         return None
 
 
-# Tracks a "what rate did you quote?" ForceReply prompt sent after a bid
-# is copied/drafted, so the reply can be matched back to the bid_id and
-# used to fill in bid_amount, which is unknown at click time.
-_PENDING_RATE_PROMPTS: dict = {}   # {(chat_id, prompt_msg_id): bid_id}
-_PENDING_RATE_LOCK = threading.Lock()
-
-
-def _prompt_for_bid_rate(order_id: str, bid_id: int):
-    """
-    Send a ForceReply prompt asking what rate was quoted, and remember
-    the (chat_id, prompt_msg_id) -> bid_id mapping so the reply can be
-    matched back and forwarded to /api/update_bid_amount. Mirrors the
-    pattern driver_bot.py already uses for driver-entered rates.
-
-    Bypasses _telegram_send_one (needs the returned message_id, which
-    that helper doesn't hand back) so it needs its own _TELEGRAM_ENABLED
-    check rather than inheriting one from a shared choke point.
-    """
-    if not _TELEGRAM_ENABLED:
-        print(f"[TELEGRAM] suppressed rate-prompt (toggle off) for bid_id={bid_id}")
-        return
-    payload = {
-        "text": f"💰 Order #{order_id} — what rate did you quote?\nReply with a number, e.g. 1400",
-        "reply_markup": json.dumps({"force_reply": True, "selective": True}),
-    }
-    with _CHAT_IDS_LOCK:
-        ids = list(CHAT_IDS)
-    for cid in ids:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        body = dict(payload)
-        body["chat_id"] = cid
-        try:
-            r = session.post(url, json=body, timeout=5)
-            if r.ok:
-                msg_id = r.json().get("result", {}).get("message_id")
-                if msg_id:
-                    with _PENDING_RATE_LOCK:
-                        _PENDING_RATE_PROMPTS[(cid, msg_id)] = bid_id
-        except Exception as e:
-            print(f"_prompt_for_bid_rate error (chat {cid}): {e}")
-
-
-def _parse_rate_amount(text: str) -> Optional[float]:
-    """Same tolerant parsing driver_bot._parse_rate uses: '1400', '$1,400',
-    '1400.00' all resolve to a float, or None if nothing parseable."""
-    cleaned = text.strip().replace("$", "").strip()
-    m = re.search(r"(\d[\d,]*(?:\.\d{1,2})?)", cleaned)
-    if not m:
-        return None
-    try:
-        return float(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
+# The "what rate did you quote?" ForceReply prompt (and its reply-
+# matching handler in handle_bid_callbacks) was removed 2026-09-09 —
+# client feedback: dispatchers won't reliably type the rate back every
+# single time they bid. bid_amount now gets filled in automatically
+# instead, via the periodic thread-learning backfill below: it reads
+# the client's own quoted rate straight out of "bid"-labeled Gmail
+# threads, and confirms wins via the "RC" (Rate Confirmation) label —
+# see run_thread_learning_backfill() / _periodic_thread_learning_backfill().
 
 # =============================================================
-# THREAD LEARNING — manual backfill, gated on the server-side toggle
+# THREAD LEARNING — automatic periodic backfill, gated on the
+# server-side toggle (thread_learning_enabled)
 # =============================================================
 
 def run_thread_learning_backfill(days_back: int = 45) -> dict:
@@ -1118,30 +1075,11 @@ def handle_bid_callbacks(service):
             TELEGRAM_UPDATE_OFFSET = new_offset
 
     for upd in updates:
-        # ── Handle rate-reply messages first (not a callback_query) ────
-        msg = upd.get("message")
-        if msg and not upd.get("callback_query"):
-            chat_id     = msg.get("chat", {}).get("id")
-            text        = (msg.get("text") or "").strip()
-            reply_to    = msg.get("reply_to_message") or {}
-            reply_to_id = reply_to.get("message_id")
-            if chat_id and reply_to_id:
-                with _PENDING_RATE_LOCK:
-                    bid_id = _PENDING_RATE_PROMPTS.pop((chat_id, reply_to_id), None)
-                if bid_id:
-                    amount = _parse_rate_amount(text)
-                    if amount is not None:
-                        try:
-                            call_update_bid_amount(ACTIVE_LICENSE_KEY, _get_machine_id(),
-                                                   bid_id, amount)
-                            send_to_telegram(f"✅ Rate ${amount:,.0f} recorded for bid #{bid_id}.")
-                        except Exception as e:
-                            print(f"call_update_bid_amount failed: {e}")
-                    else:
-                        send_to_telegram(
-                            f"⚠️ Could not read a rate from \"{text}\". "
-                            f"Reply with a number only, e.g. 1400"
-                        )
+        # Plain (non-callback) messages — e.g. a dispatcher typing in the
+        # chat — nothing to do with them since the ForceReply rate-prompt
+        # flow was removed (2026-09-09); only callback_query updates
+        # (button taps) matter below.
+        if not upd.get("callback_query"):
             continue
 
         cq = upd.get("callback_query")
@@ -1180,8 +1118,8 @@ def handle_bid_callbacks(service):
                     else:
                         webbrowser.open("https://mail.google.com/mail/u/0/#all")
                     _bid_id = _record_bid(load, "pc", selected)
-                    if _bid_id:
-                        _prompt_for_bid_rate(order_id, _bid_id)
+                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                    # now fills in automatically via thread learning instead)
                     send_to_telegram(
                         f"📋 Bid for {selected['driver_name']} copied. Press Reply and paste (Ctrl+V).")
                 except Exception as e:
@@ -1200,8 +1138,8 @@ def handle_bid_callbacks(service):
                     else:
                         webbrowser.open("https://mail.google.com/mail/u/0/#all")
                     _bid_id = _record_bid(load, "pc")
-                    if _bid_id:
-                        _prompt_for_bid_rate(order_id, _bid_id)
+                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                    # now fills in automatically via thread learning instead)
                     send_to_telegram("📋 Bid text copied. Press Reply and paste (Ctrl+V).")
                 except Exception as e:
                     print("Bid callback failed:", e)
@@ -1248,8 +1186,8 @@ def handle_bid_callbacks(service):
                     draft    = create_reply_draft(service, original_msg, "", None, empty=True)
                     draft_id = draft.get("id", "")
                     _bid_id = _record_bid(load, "phone", selected)
-                    if _bid_id:
-                        _prompt_for_bid_rate(order_id, _bid_id)
+                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                    # now fills in automatically via thread learning instead)
                     if draft_id:
                         draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
                         send_to_telegram_with_buttons(
@@ -1278,8 +1216,8 @@ def handle_bid_callbacks(service):
                     draft    = create_reply_draft(service, original_msg, "", None, empty=True)
                     draft_id = draft.get("id", "")
                     _bid_id = _record_bid(load, "phone")
-                    if _bid_id:
-                        _prompt_for_bid_rate(order_id, _bid_id)
+                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                    # now fills in automatically via thread learning instead)
                     if draft_id:
                         draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
                         send_to_telegram_with_buttons(
@@ -1332,16 +1270,16 @@ def handle_bid_callbacks(service):
                 body = _build_bid_body_for_load(load, selected)
                 if body:
                     _bid_id = _record_bid(load, "draft", selected)
-                    if _bid_id:
-                        _prompt_for_bid_rate(order_id, _bid_id)
+                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                    # now fills in automatically via thread learning instead)
                     send_to_telegram(f"📋 ORDER #{order_id} — {selected['driver_name']}:\n\n{body}")
 
             elif not all_trucks or len(all_trucks) == 1:
                 body = _build_bid_body_for_order(order_id)
                 if body:
                     _bid_id = _record_bid(load, "draft")
-                    if _bid_id:
-                        _prompt_for_bid_rate(order_id, _bid_id)
+                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                    # now fills in automatically via thread learning instead)
                     send_to_telegram(f"📋 ORDER #{order_id}:\n\n{body}")
 
             else:
@@ -2218,11 +2156,10 @@ def create_app():
     # ── Telegram on/off — status-only, no button (button removed
     # 2026-09-08 on request). The desktop still needs to KNOW and RESPECT
     # this flag — it's the same telegram_enabled column the web
-    # dashboard's own Settings toggle controls, and _telegram_send_one/
-    # _prompt_for_bid_rate both gate on _TELEGRAM_ENABLED on every real
-    # send — so this keeps polling status in the background with no UI
-    # control of its own; toggling it now only happens from the web
-    # dashboard, not here.
+    # dashboard's own Settings toggle controls, and _telegram_send_one
+    # gates on _TELEGRAM_ENABLED on every real send — so this keeps
+    # polling status in the background with no UI control of its own;
+    # toggling it now only happens from the web dashboard, not here.
     def _load_telegram_status():
         global _TELEGRAM_ENABLED
         result = call_get_telegram_status(ACTIVE_LICENSE_KEY, _get_machine_id())
@@ -2261,6 +2198,28 @@ def create_app():
             daemon=True).start(),
     )
     backfill_btn.pack(side="top", anchor="e", pady=(4, 0))
+
+    # ── Automatic periodic backfill (2026-09-09) — replaces the manual
+    # "type the rate into Telegram" flow. Every 15 minutes while the bot
+    # is actually running, silently re-scans the last few days of
+    # labeled threads: an "RC" (Rate Confirmation) label is definitive
+    # proof a bid was won, and a "bid"-labeled thread's own dispatcher
+    # reply is where the actually-quoted rate gets read from — both go
+    # straight into bid_history server-side (thread_learner.py), no
+    # dispatcher action needed. Small days_back (3) keeps each run fast/
+    # light instead of re-walking the full history every time; the
+    # manual "⏳ Run backfill" button above still does a deep 45-day
+    # pass on demand. run_thread_learning_backfill() already re-checks
+    # the server-side enabled flag itself, so this safely no-ops if
+    # thread learning ever gets turned off.
+    def _periodic_thread_learning_backfill():
+        if not STOP_EVENT.is_set():
+            def _run():
+                result = run_thread_learning_backfill(days_back=3)
+                print(f"[BACKFILL] periodic run: {result}")
+            threading.Thread(target=_run, daemon=True).start()
+        root.after(15 * 60 * 1000, _periodic_thread_learning_backfill)
+    root.after(15 * 60 * 1000, _periodic_thread_learning_backfill)
 
     gh_status_row = tk.Frame(hdr_right, bg=_C["bg"])
     gh_status_row.pack(side="top", anchor="e", pady=(4, 0))
@@ -3044,6 +3003,24 @@ def create_app():
                     "notifications will still send this session, but the "
                     "toggle may not stay on long-term.")
         threading.Thread(target=_enable_telegram_serverside, daemon=True).start()
+
+        # Same reasoning as Telegram just above, for thread learning
+        # (2026-09-09): the client shouldn't have to remember to flip
+        # this on for bid_amount/win-loss to start filling in
+        # automatically — pressing START should just make it work.
+        # The header "🧠 Learning" button still exists and can turn it
+        # back off; this only changes the default at START time.
+        def _enable_learning_serverside():
+            result = call_set_thread_learning(ACTIVE_LICENSE_KEY, _get_machine_id(), True)
+            if result and result.get("success"):
+                root.after(0, lambda: (
+                    learning_btn_enabled.__setitem__("state", result.get("enabled", True)),
+                    _refresh_learning_btn(),
+                ))
+            else:
+                log("⚠ Couldn't confirm thread learning enabled with the server.")
+        threading.Thread(target=_enable_learning_serverside, daemon=True).start()
+
         BOT_THREAD = threading.Thread(
             target=run_bot_from_gui,
             args=(v_ent.get(), t_box.get("1.0", "end"),
