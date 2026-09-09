@@ -943,6 +943,8 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
                 "broker_name":     load.get("broker_name", ""),
                 "broker_email":    load.get("broker_email", ""),
                 "deadhead_miles":  driver.get("google_deadhead") or load.get("google_deadhead"),
+                "loaded_miles":    load.get("loaded_miles"),
+                "total_miles":     load.get("total_miles"),
                 "verified_miles":  (load.get("maps_verification") or {}).get("verified_miles"),
                 "verified_source": (load.get("maps_verification") or {}).get("verified_source"),
             },
