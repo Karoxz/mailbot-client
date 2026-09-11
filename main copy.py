@@ -198,10 +198,7 @@ BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
 # so driver bid replies never mix into the dispatcher's own chat. Same
 # hardcoded-constant pattern as BOT_TOKEN itself (not a GUI field).
-# TODO: paste the real driver bot token here — left blank for now, which
-# safely no-ops (driver_bot.py's own _driver_api() checks `if not token`
-# and skips every call) rather than crashing or sending with a bad token.
-DRIVER_BOT_TOKEN       = ""
+DRIVER_BOT_TOKEN       = "8371628317:AAEEcVu0jnpKu9Zni3meYMSlcpRaanv1VhE"
 TELEGRAM_UPDATE_OFFSET = 0
 TELEGRAM_OFFSET_LOCK   = threading.Lock()
 
