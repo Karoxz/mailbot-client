@@ -32,7 +32,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from api_client import call_record_bid
-from client.main import ACTIVE_LICENSE_KEY, _get_machine_id
 # =============================================================
 # LOGGING
 # =============================================================
@@ -475,48 +474,7 @@ def _record_driver_bid(driver_name: str, order_id: str, load_data: dict, rate_st
         )
     except Exception as e:
         _l(f"_record_driver_bid failed (non-fatal): {e}", "warning")
-        
 
-def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Optional[int]:
-    """
-    Called right after a bid is actually copied/sent/drafted (BID PC,
-    BID PHONE, or DRAFT). `truck` is the selected all_trucks entry when
-    the dispatcher chose a specific driver from a multi-truck list;
-    None when there was only one candidate and `load`'s own top-level
-    fields (driver_name/truck_type/google_deadhead) apply instead.
-
-    Never let a history-write failure affect the actual bid action —
-    this always runs after the real send/copy/draft has already
-    happened, and any error here is swallowed and logged only.
-
-    Returns the new bid_id (or None on failure) so the caller can
-    prompt for the rate afterward and fill it in via
-    call_update_bid_amount once the dispatcher types it.
-    """
-    driver = truck if truck else load
-    try:
-        result = call_record_bid(
-            license_key=ACTIVE_LICENSE_KEY,
-            machine_id=_get_machine_id(),
-            bid_data={
-                "order_id":        load.get("order", ""),
-                "thread_id":       load.get("original_msg_full", {}).get("threadId", ""),
-                "bid_method":      method,
-                "vehicle_type":    driver.get("truck_type") or load.get("vehicle_required", ""),
-                "driver_name":     driver.get("driver_name", ""),
-                "pickup_loc":      load.get("pickup_loc", ""),
-                "delivery_loc":    load.get("delivery_loc", ""),
-                "broker_name":     load.get("broker_name", ""),
-                "broker_email":    load.get("broker_email", ""),
-                "deadhead_miles":  driver.get("google_deadhead") or load.get("google_deadhead"),
-                "verified_miles":  (load.get("maps_verification") or {}).get("verified_miles"),
-                "verified_source": (load.get("maps_verification") or {}).get("verified_source"),
-            },
-        )
-        return result.get("bid_id") if result else None
-    except Exception as e:
-        print(f"_record_bid failed (non-fatal): {e}")
-        return None
 
 def _build_and_forward_bid(driver_name: str, order_id: str,
                            load_data: dict, rate_str: str):

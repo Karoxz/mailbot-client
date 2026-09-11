@@ -72,6 +72,16 @@ from activation_screen import run_activation_gate
 from api_client import call_parse, call_build_bid, call_record_bid, call_classify_reply
 from license_manager import get_machine_id
 
+# Driver bot (2026-09-11) — optional, self-contained module; its own
+# import failing (e.g. a missing dependency) must never take down the
+# whole dispatcher app, so it's wrapped exactly per its own documented
+# integration contract (see the top of driver_bot.py).
+try:
+    import driver_bot
+except Exception as _e:
+    driver_bot = None
+    print(f"driver_bot import failed (driver bot disabled): {_e}")
+
 # Cache machine_id once — it never changes during a session
 _MACHINE_ID: str = ""
 
@@ -185,6 +195,13 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
     return configured_path
 
 BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
+# Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
+# so driver bid replies never mix into the dispatcher's own chat. Same
+# hardcoded-constant pattern as BOT_TOKEN itself (not a GUI field).
+# TODO: paste the real driver bot token here — left blank for now, which
+# safely no-ops (driver_bot.py's own _driver_api() checks `if not token`
+# and skips every call) rather than crashing or sending with a bad token.
+DRIVER_BOT_TOKEN       = ""
 TELEGRAM_UPDATE_OFFSET = 0
 TELEGRAM_OFFSET_LOCK   = threading.Lock()
 
@@ -216,6 +233,7 @@ FRESH_WINDOW      = "2d"
 STOP_EVENT        = threading.Event()
 BOT_THREAD        = None
 TRUCKS            = []
+_DRIVER_BOT_ENABLED = False   # set by _init_driver_bot(), read in _process_email
 LOAD_STORE        = {}
 LOAD_STORE_LOCK   = threading.Lock()
 BID_TEMPLATE_LOCK = threading.Lock()
@@ -354,6 +372,20 @@ def parse_truck_definitions(text):
         # EQUIPMENT/STATES/ZIP/DATE above.
         radius_raw   = parts[8] if len(parts) > 8 else ""
         radius_miles = parse_weight_lbs(radius_raw) if radius_raw.strip() else None
+        # CHAT_ID (2026-09-11) — optional 10th field, this driver's own
+        # Telegram chat ID with the (separate) driver bot. Set = the
+        # driver bot sends them load cards and forwards their bids to
+        # the dispatcher chat; blank = driver bot skips them entirely.
+        # Uses int(), not parse_weight_lbs(), because a Telegram GROUP
+        # chat ID is negative (e.g. -1001234567890) — parse_weight_lbs'
+        # digits-only regex would silently strip the sign.
+        chatid_raw = parts[9] if len(parts) > 9 else ""
+        telegram_chat_id = None
+        if chatid_raw.strip():
+            try:
+                telegram_chat_id = int(chatid_raw.strip())
+            except ValueError:
+                telegram_chat_id = None
         truck_states = expand_states(states_raw) if states_raw.strip() else None
         trucks.append({
             "vehicle":         vehicle.upper(),
@@ -366,6 +398,7 @@ def parse_truck_definitions(text):
             "allowed_states":  truck_states,
             "equipment":       equipment,
             "radius_miles":    radius_miles,
+            "telegram_chat_id": telegram_chat_id,
         })
     return trucks
 
@@ -408,6 +441,12 @@ def validate_truck_definitions(text):
         if len(parts) > 8 and parts[8].strip():
             if parse_weight_lbs(parts[8]) is None:
                 errors.append(f"Line {i}: cannot parse radius '{parts[8]}' as a number")
+        if len(parts) > 9 and parts[9].strip():
+            try:
+                int(parts[9].strip())
+            except ValueError:
+                errors.append(f"Line {i}: chat ID '{parts[9]}' must be a whole number "
+                               f"(get it from @userinfobot on Telegram)")
     return errors
 
 # =============================================================
@@ -1654,6 +1693,22 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                 else:
                     _log(f"[{ts}] ❌ #{order}{gmid_tag}  →  Telegram send FAILED "
                         f"(check chat ID / bot token — see log file for details)")
+
+                # Driver bot — independent of the dispatcher send above
+                # (own bot, own chat(s), own failure mode; a dispatcher
+                # send failure shouldn't also block drivers from seeing
+                # the load). Per driver_bot.py's own documented
+                # integration contract.
+                if _DRIVER_BOT_ENABLED and driver_bot is not None:
+                    with LOAD_STORE_LOCK:
+                        _ld_for_drivers = dict(LOAD_STORE.get(order, {}))
+                    if _ld_for_drivers:
+                        _ld_for_drivers["formatted_message"] = formatted
+                        threading.Thread(
+                            target=driver_bot.notify_drivers,
+                            args=(order, _ld_for_drivers),
+                            daemon=True,
+                        ).start()
             else:
                 _log(f"[{ts}] ⏭  SKIPPED{order_tag}{gmid_tag}  →  {info}")
 
@@ -2706,7 +2761,7 @@ def create_app():
 
     # ── TRUCKS SECTION ────────────────────────────────────────────────────
     trk_sec = _section(cfg_pane,
-        "🚛  TRUCKS  ·  VEHICLE:DRIVER:DIMS:PAYLOAD:EQUIPMENT:STATES:ZIP[:DATE[:RADIUS]]")
+        "🚛  TRUCKS  ·  VEHICLE:DRIVER:DIMS:PAYLOAD:EQUIPMENT:STATES:ZIP[:DATE[:RADIUS[:CHAT_ID]]]")
 
     guide_frame = tk.Frame(trk_sec, bg=_C["input"], padx=8, pady=6)
     guide_frame.pack(fill="x", pady=(0, 6))
@@ -2717,12 +2772,12 @@ def create_app():
              bg=_C["input"], fg=_C["accent"],
              font=("Segoe UI", 10, "bold")).pack(anchor="w")
     tk.Label(guide_frame,
-             text="VEHICLE : DRIVER : LxWxH : MAX LBS : EQUIPMENT : STATES : ZIP : DATE : RADIUS",
+             text="VEHICLE : DRIVER : LxWxH : MAX LBS : EQUIPMENT : STATES : ZIP : DATE : RADIUS : CHAT_ID",
              bg=_C["input"], fg=_C["text"],
              font=("Consolas", 10)).pack(anchor="w", pady=(2, 2))
     tk.Label(guide_frame,
              text="Example:  LARGE STRAIGHT:John Smith:264x97x103:26000"
-                  ":Dock High,Air Ride:OH,PA,NY:44129:05/29/26:150",
+                  ":Dock High,Air Ride:OH,PA,NY:44129:05/29/26:150:111222333",
              bg=_C["input"], fg=_C["green"],
              font=("Consolas", 10)).pack(anchor="w")
     tk.Label(guide_frame,
@@ -2730,6 +2785,11 @@ def create_app():
                   "regions: East Coast · Midwest · West Coast          "
                   "DATE: blank = any  |  format: MM/DD/YY          "
                   "RADIUS: blank = use Max radius above  |  e.g. 150",
+             bg=_C["input"], fg=_C["text"],
+             font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
+    tk.Label(guide_frame,
+             text="CHAT_ID: this driver's own Telegram chat ID with the driver "
+                  "bot — blank = driver bot skips them  |  get it from @userinfobot",
              bg=_C["input"], fg=_C["text"],
              font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
 
@@ -2752,7 +2812,11 @@ def create_app():
              "DATE      — optional, e.g. 05/29/26\n"
              "RADIUS    — optional, this truck's own max radius in "
              "miles (e.g. 150) — blank uses the Max radius setting "
-             "above instead")
+             "above instead\n"
+             "CHAT_ID   — optional, this driver's own Telegram chat ID "
+             "— set it and the driver bot sends them load cards and "
+             "lets them tap BID; blank = driver bot skips them. Get a "
+             "driver's chat ID by having them message @userinfobot")
 
     # ── Load persisted config ─────────────────────────────────────────────
     _cfg = _load_config()
@@ -3089,12 +3153,16 @@ def create_app():
         _set_running(False)
         set_graphhopper_status("Stopped")
         log("⏹  Bot stopped.")
+        if _DRIVER_BOT_ENABLED and driver_bot is not None:
+            threading.Thread(target=driver_bot.shutdown, daemon=True).start()
 
     start_btn.config(command=start_bot)
     stop_btn.config(command=stop_bot)
 
     def on_close():
         STOP_EVENT.set()
+        if _DRIVER_BOT_ENABLED and driver_bot is not None:
+            threading.Thread(target=driver_bot.shutdown, daemon=True).start()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
@@ -3109,6 +3177,66 @@ def create_app():
     root.after(80, lambda: _apply_titlebar(root, dark=(_current_theme == "dark")))
 
     root.mainloop()
+
+# =============================================================
+# DRIVER BOT — activation
+#
+# driver_bot.py is a fully self-contained module (own Telegram bot
+# token/session/poll loop) that was written but never actually wired
+# into the dispatcher — confirmed 2026-09-11: zero references to it
+# anywhere in this file before this. Following its own documented
+# integration contract (top of driver_bot.py): builds driver_config.json
+# from whatever's currently in TRUCKS/CHAT_IDS/BOT_TOKEN (so drivers are
+# configured the exact same place trucks already are — the CHAT_ID field
+# on a truck's own line — instead of a separate file the client would
+# have to hand-edit) and starts it.
+# =============================================================
+
+def _init_driver_bot():
+    global _DRIVER_BOT_ENABLED
+    if driver_bot is None:
+        _DRIVER_BOT_ENABLED = False
+        return  # import failed at startup — already logged, silent no-op
+
+    # Guard against a second poll thread — driver_bot.init() itself has
+    # no such check, and pressing START twice without STOP in between
+    # would otherwise start two independent pollers on the same bot
+    # token (duplicate driver notifications, same bug class as the
+    # dispatcher-side reply/duplicate-notify fix from 2026-09-11).
+    _existing = getattr(driver_bot, "_POLL_THREAD", None)
+    if _DRIVER_BOT_ENABLED and _existing is not None and _existing.is_alive():
+        print("Driver bot already running — not starting a second poller.")
+        return
+
+    _DRIVER_BOT_ENABLED = False
+    drivers = [
+        {"name": t.get("driver_name", ""), "telegram_chat_id": t["telegram_chat_id"],
+         "truck_type": t.get("vehicle", "")}
+        for t in TRUCKS if t.get("telegram_chat_id")
+    ]
+    if not drivers:
+        return  # no truck line has a CHAT_ID set — nothing to activate
+    if not DRIVER_BOT_TOKEN:
+        print("Driver bot: drivers configured but DRIVER_BOT_TOKEN is "
+              "blank — staying off. Set it in main copy.py and rebuild.")
+        return
+
+    with _CHAT_IDS_LOCK:
+        dispatcher_ids = list(CHAT_IDS)
+    driver_bot.save_config({
+        "driver_bot_token":     DRIVER_BOT_TOKEN,
+        "dispatcher_bot_token": BOT_TOKEN,
+        "dispatcher_chat_ids":  dispatcher_ids,
+        "drivers":              drivers,
+    })
+    try:
+        _DRIVER_BOT_ENABLED = driver_bot.init(ACTIVE_LICENSE_KEY, _get_machine_id())
+    except Exception as e:
+        print(f"driver_bot.init() failed (driver bot disabled): {e}")
+        _DRIVER_BOT_ENABLED = False
+    if _DRIVER_BOT_ENABLED:
+        print(f"Driver bot active — {len(drivers)} driver(s) configured.")
+
 
 # =============================================================
 # BOT RUNNER
@@ -3132,6 +3260,7 @@ def run_bot_from_gui(vehicles, truck_text, radius_txt, poll_txt,
         log_func(f"Telegram Chat IDs: using default {CHAT_IDS}")
 
     TRUCKS = parse_truck_definitions(truck_text)
+    _init_driver_bot()
     STOP_EVENT.clear()
 
     del_states_raw = (delivery_states_txt or "").strip()
