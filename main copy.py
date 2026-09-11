@@ -348,6 +348,12 @@ def parse_truck_definitions(text):
         states_raw   = parts[5] if len(parts) > 5 else ""
         zip_loc      = parts[6] if len(parts) > 6 else ""
         date         = parts[7].upper() if len(parts) > 7 else ""
+        # RADIUS (2026-09-11) — optional 9th field, per-vehicle override
+        # of the global Max radius setting. Blank/absent = use the
+        # global default, same "trailing optional field" pattern as
+        # EQUIPMENT/STATES/ZIP/DATE above.
+        radius_raw   = parts[8] if len(parts) > 8 else ""
+        radius_miles = parse_weight_lbs(radius_raw) if radius_raw.strip() else None
         truck_states = expand_states(states_raw) if states_raw.strip() else None
         trucks.append({
             "vehicle":         vehicle.upper(),
@@ -359,6 +365,7 @@ def parse_truck_definitions(text):
             "pickup_date":     date,
             "allowed_states":  truck_states,
             "equipment":       equipment,
+            "radius_miles":    radius_miles,
         })
     return trucks
 
@@ -398,6 +405,9 @@ def validate_truck_definitions(text):
                     pass
             if not valid:
                 errors.append(f"Line {i}: date '{parts[7]}' must be MM/DD/YYYY or MM/DD/YY")
+        if len(parts) > 8 and parts[8].strip():
+            if parse_weight_lbs(parts[8]) is None:
+                errors.append(f"Line {i}: cannot parse radius '{parts[8]}' as a number")
     return errors
 
 # =============================================================
@@ -1583,6 +1593,7 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                     "equipment":       t.get("equipment", ""),
                     "allowed_states":  list(t["allowed_states"]) if t.get("allowed_states") else None,
                     "pickup_date":     t.get("pickup_date", ""),
+                    "radius_miles":    t.get("radius_miles"),
                 })
 
             _T2 = time.perf_counter()
@@ -2717,7 +2728,8 @@ def create_app():
     tk.Label(guide_frame,
              text="STATES: blank = all states  |  codes: OH,PA,NY  |  "
                   "regions: East Coast · Midwest · West Coast          "
-                  "DATE: blank = any  |  format: MM/DD/YY",
+                  "DATE: blank = any  |  format: MM/DD/YY          "
+                  "RADIUS: blank = use Max radius above  |  e.g. 150",
              bg=_C["input"], fg=_C["text"],
              font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
 
@@ -2737,7 +2749,10 @@ def create_app():
              "EQUIPMENT — e.g. Dock High,Air Ride,Lift Gate\n"
              "STATES    — blank=all, or OH,PA or East Coast\n"
              "ZIP       — truck's current location\n"
-             "DATE      — optional, e.g. 05/29/26")
+             "DATE      — optional, e.g. 05/29/26\n"
+             "RADIUS    — optional, this truck's own max radius in "
+             "miles (e.g. 150) — blank uses the Max radius setting "
+             "above instead")
 
     # ── Load persisted config ─────────────────────────────────────────────
     _cfg = _load_config()
