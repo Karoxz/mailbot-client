@@ -1548,6 +1548,30 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                     daemon=True,
                 ).start()
 
+            # STEP 4.5: reply guard — don't re-parse an in-thread REPLY as
+            # if it were a brand new freight posting. Real bug, reported
+            # 2026-09-11: a broker's reply to an existing bid thread kept
+            # matching FREIGHT_MARKERS (it quotes/keeps the original
+            # subject, e.g. "Re: ... LARGE STRAIGHT ..."), so it sailed
+            # through every guard above and got fully re-parsed AND
+            # re-notified as a fresh posting — resending the whole
+            # original bid message the dispatcher had already seen, among
+            # other duplicate Telegram sends from the same reply. In-Reply-To
+            # is only ever set by the sender's mail client when actually
+            # replying to a specific prior message — a genuine NEW posting,
+            # even a follow-up one in the same thread, is never "in reply
+            # to" anything. classify_reply() just above already handles
+            # won/lost/countered detection for exactly this case; it
+            # shouldn't ALSO go through the full match+notify pipeline.
+            _in_reply_to = ""
+            for _h in full.get("payload", {}).get("headers", []):
+                if _h.get("name", "").lower() == "in-reply-to":
+                    _in_reply_to = (_h.get("value") or "").strip()
+                    break
+            if _in_reply_to:
+                processed_ids.add(msg_id)
+                return
+
             trucks_payload = []
             for t in TRUCKS:
                 trucks_payload.append({
