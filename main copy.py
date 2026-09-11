@@ -2706,7 +2706,7 @@ def create_app():
 
     # ── TRUCKS SECTION ────────────────────────────────────────────────────
     trk_sec = _section(cfg_pane,
-        "🚛  TRUCKS  ·  VEHICLE:DRIVER:DIMS:PAYLOAD:EQUIPMENT:STATES:ZIP[:DATE]")
+        "🚛  TRUCKS  ·  VEHICLE:DRIVER:DIMS:PAYLOAD:EQUIPMENT:STATES:ZIP[:DATE[:RADIUS]]")
 
     guide_frame = tk.Frame(trk_sec, bg=_C["input"], padx=8, pady=6)
     guide_frame.pack(fill="x", pady=(0, 6))
@@ -2717,12 +2717,12 @@ def create_app():
              bg=_C["input"], fg=_C["accent"],
              font=("Segoe UI", 10, "bold")).pack(anchor="w")
     tk.Label(guide_frame,
-             text="VEHICLE : DRIVER : LxWxH : MAX LBS : EQUIPMENT : STATES : ZIP : DATE",
+             text="VEHICLE : DRIVER : LxWxH : MAX LBS : EQUIPMENT : STATES : ZIP : DATE : RADIUS",
              bg=_C["input"], fg=_C["text"],
              font=("Consolas", 10)).pack(anchor="w", pady=(2, 2))
     tk.Label(guide_frame,
              text="Example:  LARGE STRAIGHT:John Smith:264x97x103:26000"
-                  ":Dock High,Air Ride:OH,PA,NY:44129:05/29/26",
+                  ":Dock High,Air Ride:OH,PA,NY:44129:05/29/26:150",
              bg=_C["input"], fg=_C["green"],
              font=("Consolas", 10)).pack(anchor="w")
     tk.Label(guide_frame,
@@ -2737,7 +2737,7 @@ def create_app():
     _theme_text(t_box)
     t_box.insert("1.0",
         "LARGE STRAIGHT:John Smith:264x97x103:8000"
-        ":Dock High,Air Ride:OH,PA,NY:44129"
+        ":Dock High,Air Ride:OH,PA,NY:44129::150"
     )
     t_box.pack(fill="x")
     _Tooltip(t_box,
