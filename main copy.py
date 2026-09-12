@@ -194,6 +194,15 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
         return direct
     return configured_path
 
+# Bumped on every rebuild handed to the client — shown in the window
+# title bar and the very first log line. Added 2026-09-12 after a real
+# case of "I installed the latest version but the old bug is still
+# there" that traced to a stale exe somewhere in the hand-off, not an
+# actual code issue (confirmed via direct code search + a fresh
+# launch test, twice) — this makes "which build is this, really"
+# instantly checkable without any back-and-forth investigation.
+BUILD_VERSION          = "2026-09-12a"
+
 BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
 # so driver bid replies never mix into the dispatcher's own chat. Same
@@ -2178,7 +2187,7 @@ def create_app():
                 pass
 
     root = tk.Tk()
-    root.title("")
+    root.title(f"PLUTUS BOT — build {BUILD_VERSION}")
     root.configure(bg=_C["bg"])
     root.minsize(800, 700)
     root.resizable(True, True)
@@ -3559,6 +3568,8 @@ def on_license_valid(key):
         input("Press Enter to close...")
 
 if __name__ == "__main__":
+    print(f"PLUTUS BOT — build {BUILD_VERSION}", flush=True)
+    _flog("info", f"PLUTUS BOT starting — build {BUILD_VERSION}")
     try:
         run_activation_gate(on_license_valid)
     except Exception as e:
