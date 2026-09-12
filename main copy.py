@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-12d"
+BUILD_VERSION          = "2026-09-12e"
 
 BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
@@ -1102,10 +1102,6 @@ def _run_classify_and_notify(license_key: str, machine_id: str,
     broker_name  = order.get("broker_name", "")
     lane = f"{pickup_loc} → {delivery_loc}" if pickup_loc and delivery_loc else ""
 
-    body_excerpt = (body or "").strip()
-    if len(body_excerpt) > 400:
-        body_excerpt = body_excerpt[:400].rstrip() + "…"
-
     header_bits = [b for b in (f"Order #{order_id}" if order_id else "",
                                 broker_name, lane) if b]
     header = "  ·  ".join(header_bits)
@@ -1123,12 +1119,19 @@ def _run_classify_and_notify(license_key: str, machine_id: str,
         # the thread directly for anything genuinely ambiguous.
         return
 
+    # No raw reply excerpt — real bug, reported 2026-09-12 with a real
+    # example: a broker's reply signature block (name/phone/MC/DOT/
+    # address) PLUS the fully-quoted original bid text ("On ... wrote:
+    # > Rate: $1500...") were both getting dumped into the notification
+    # underneath the AI's own reason line, which already says what
+    # actually matters ("Broker proposes a lower rate of $1400 instead
+    # of the original $1500") — the raw excerpt was pure noise on top
+    # of that summary, not new information. Header + reason only now;
+    # the OPEN THREAD button below is how to read the real message.
     cls    = result.get("classification", {}) or {}
     status = cls.get("status", "")
     emoji  = _REPLY_STATUS_EMOJI.get(status, "✉️")
-    text = (f"{emoji} {status.upper()} — {header}\n"
-            f"“{cls.get('reason', '')}”\n\n"
-            f"{body_excerpt}")
+    text = f"{emoji} {status.upper()} — {header}\n“{cls.get('reason', '')}”"
 
     mobile_url = build_gmail_thread_url(thread_id) if thread_id else None
     send_to_telegram(text, open_url=mobile_url, open_url_text="OPEN THREAD")
