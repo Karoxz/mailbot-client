@@ -1052,15 +1052,25 @@ def _run_classify_and_notify(license_key: str, machine_id: str,
                                 broker_name, lane) if b]
     header = "  ·  ".join(header_bits)
 
-    if result.get("updated"):
-        cls    = result.get("classification", {}) or {}
-        status = cls.get("status", "")
-        emoji  = _REPLY_STATUS_EMOJI.get(status, "✉️")
-        text = (f"{emoji} {status.upper()} — {header}\n"
-                f"“{cls.get('reason', '')}”\n\n"
-                f"{body_excerpt}")
-    else:
-        text = f"✉️ Reply — {header}\n\n{body_excerpt}"
+    if not result.get("updated"):
+        # No confident won/lost/countered signal — real bug, reported
+        # 2026-09-12: this "inconclusive, notify anyway" branch fired on
+        # a raw Sylectus repost/reminder in an already-bid thread (no
+        # human reply content at all, just the same posting blurb again)
+        # — genuinely nothing worth interrupting the dispatcher for.
+        # Silently drop it; only a confident classification below still
+        # sends. Trades away surfacing a genuinely-inconclusive HUMAN
+        # reply (rare) for not paging the dispatcher over load-board
+        # noise (apparently common) — the dispatcher can always check
+        # the thread directly for anything genuinely ambiguous.
+        return
+
+    cls    = result.get("classification", {}) or {}
+    status = cls.get("status", "")
+    emoji  = _REPLY_STATUS_EMOJI.get(status, "✉️")
+    text = (f"{emoji} {status.upper()} — {header}\n"
+            f"“{cls.get('reason', '')}”\n\n"
+            f"{body_excerpt}")
 
     mobile_url = build_gmail_thread_url(thread_id) if thread_id else None
     send_to_telegram(text, open_url=mobile_url, open_url_text="OPEN THREAD")
