@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-12b"
+BUILD_VERSION          = "2026-09-12c"
 
 BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
@@ -833,6 +833,44 @@ def extract_text_from_full_message(msg_full):
     if html and html.strip():
         return html_to_text(html)
     return msg_full.get("snippet", "")
+
+
+# Quote-boundary patterns recognized by _strip_quoted_reply() below —
+# the standard markers Gmail, Outlook, and Apple Mail insert above
+# quoted history in a reply. Checked top-posting style (new text first,
+# quote below), which is the default in every major mail client.
+_QUOTE_BOUNDARY_PATTERNS = [
+    re.compile(r"^\s*>"),                                   # plain-text quoted line
+    re.compile(r"^On .+ wrote:\s*$", re.IGNORECASE),         # Gmail/Apple Mail/most clients
+    re.compile(r"^-{2,}\s*Original Message\s*-{2,}", re.IGNORECASE),  # Outlook
+]
+
+
+def _strip_quoted_reply(text: str) -> str:
+    """
+    Returns only the NEW content of a reply, before the first quoted-
+    history boundary — real fix, 2026-09-12: the In-Reply-To-based
+    reply guard this replaced blocked the ENTIRE match+notify pipeline
+    for every message carrying that header, which turned out to also
+    silently withhold genuinely re-biddable loads (a broker's "still
+    open"/bump notification for something already bid on, which can
+    carry In-Reply-To for reasons unrelated to being a human reply) —
+    not just suppress an unwanted resend. This is a strictly better
+    signal: it only removes QUOTED content, so a fresh posting (which
+    never contains a quote boundary) passes through completely
+    unchanged and reaches the normal pipeline regardless of any header,
+    while a genuine human reply that quotes the full original posting
+    inline (the actual cause of the original "resent the whole bid 6x"
+    bug) has that quoted part cut away before parsing, so it correctly
+    fails to re-match as a fresh posting. A message with no recognized
+    quote boundary is returned unchanged — this only ever removes
+    content, never blocks a message outright.
+    """
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
+        if any(p.match(line) for p in _QUOTE_BOUNDARY_PATTERNS):
+            return "\n".join(lines[:i]).strip()
+    return (text or "").strip()
 
 # =============================================================
 # REPLY DRAFT — identical to original
@@ -1669,29 +1707,25 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                     daemon=True,
                 ).start()
 
-            # STEP 4.5: reply guard — don't re-parse an in-thread REPLY as
-            # if it were a brand new freight posting. Real bug, reported
-            # 2026-09-11: a broker's reply to an existing bid thread kept
-            # matching FREIGHT_MARKERS (it quotes/keeps the original
-            # subject, e.g. "Re: ... LARGE STRAIGHT ..."), so it sailed
-            # through every guard above and got fully re-parsed AND
-            # re-notified as a fresh posting — resending the whole
-            # original bid message the dispatcher had already seen, among
-            # other duplicate Telegram sends from the same reply. In-Reply-To
-            # is only ever set by the sender's mail client when actually
-            # replying to a specific prior message — a genuine NEW posting,
-            # even a follow-up one in the same thread, is never "in reply
-            # to" anything. classify_reply() just above already handles
-            # won/lost/countered detection for exactly this case; it
-            # shouldn't ALSO go through the full match+notify pipeline.
-            _in_reply_to = ""
-            for _h in full.get("payload", {}).get("headers", []):
-                if _h.get("name", "").lower() == "in-reply-to":
-                    _in_reply_to = (_h.get("value") or "").strip()
-                    break
-            if _in_reply_to:
-                processed_ids.add(msg_id)
-                return
+            # Quote-stripping REPLACES the old blanket In-Reply-To guard
+            # here (2026-09-12) — that header-based guard fixed the
+            # original "reply resent the whole bid 6x" bug (2026-09-11)
+            # by skipping the ENTIRE match+notify pipeline for ANY
+            # message carrying In-Reply-To, but that turned out to also
+            # silently withhold genuinely re-biddable loads (a broker's
+            # "still open"/bump notification for something already bid
+            # on can carry In-Reply-To too, unrelated to being an actual
+            # human reply) — a real load opportunity going missing
+            # silently, not just a spurious notification. _strip_quoted_
+            # reply() is content-based instead of header-based: it only
+            # removes text AFTER a recognized quote boundary, so a fresh
+            # posting (never contains one) reaches the parser completely
+            # unchanged regardless of headers, while a genuine reply that
+            # quotes the full original posting inline (the actual
+            # mechanism behind the original bug) has that quoted part cut
+            # away first, so it correctly fails to re-match as a fresh
+            # posting. See _strip_quoted_reply()'s own docstring.
+            body_for_parse = _strip_quoted_reply(body)
 
             trucks_payload = []
             for t in TRUCKS:
@@ -1712,7 +1746,7 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                 result = call_parse(
                     license_key      = ACTIVE_LICENSE_KEY,
                     machine_id       = _get_machine_id(),
-                    email_body       = body,
+                    email_body       = body_for_parse,
                     internal_date_ms = internal_date,
                     allowed_vehicles = allowed_vehicles,
                     max_radius_miles = radius,
