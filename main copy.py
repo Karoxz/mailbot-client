@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-12c"
+BUILD_VERSION          = "2026-09-12d"
 
 BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
@@ -776,8 +776,28 @@ def _extract_state_codes_from_text(text: str) -> list:
             found.append(token)
     return found
 
+# Dedup for _notify_labeled_thread() below — real bug, reported
+# 2026-09-12: 3 near-identical "📌 Label: bid" pings landed within 4
+# seconds for the same thread, because 3 separate new unread messages
+# arriving close together in that same labeled thread each
+# independently triggered this notification with nothing new to say.
+# One ping is enough to get the dispatcher's attention; repeating it
+# every few seconds for the same thread adds nothing — they can see
+# every new message once they open the thread from the button below.
+_LABELED_NOTIFY_COOLDOWN_SEC = 300  # 5 minutes
+_last_labeled_notify: dict = {}     # {thread_id: last-sent unix time}
+_labeled_notify_lock = threading.Lock()
+
+
 def _notify_labeled_thread(label_names: list, subject: str,
                             thread_id: str, svc=None, reverted: bool = False):
+    now = time.time()
+    with _labeled_notify_lock:
+        last = _last_labeled_notify.get(thread_id, 0)
+        if now - last < _LABELED_NOTIFY_COOLDOWN_SEC:
+            return
+        _last_labeled_notify[thread_id] = now
+
     states    = _extract_state_codes_from_text(subject)
     state_str = " · ".join(states) if states else "—"
     lines = [
