@@ -1001,6 +1001,62 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
         return None
 
 
+# Emoji per classify_broker_reply() outcome — anything not in this map
+# (an unrecognized status, or no confident status at all) falls back to
+# a plain envelope in _run_classify_and_notify() below.
+_REPLY_STATUS_EMOJI = {"won": "✅", "lost": "❌", "countered": "🔄"}
+
+
+def _run_classify_and_notify(license_key: str, machine_id: str,
+                             thread_id: str, subject: str, body: str):
+    """
+    Classify a broker's reply (won/lost/countered/no_signal) AND tell
+    the dispatcher a reply came in at all — real bug, reported
+    2026-09-12: the reply-guard fix from the day before (2026-09-11,
+    correctly stopping a reply from being re-parsed as a brand new
+    posting and resent 6x) had the side effect of going from "way too
+    many notifications" straight to "zero" — classify_broker_reply's
+    result was always silently discarded here, so a reply that changed
+    nothing about the message pipeline also told the dispatcher nothing
+    at all. This is now the ONLY place a reply notification comes from.
+
+    Runs on its own thread (started by the caller) so it never delays
+    the main polling loop — an LLM call on the server can take a few
+    seconds.
+    """
+    result = call_classify_reply(license_key, machine_id, thread_id, subject, body)
+    if not result or not result.get("matched"):
+        return  # no bid on file for this thread — nothing to report
+
+    order = result.get("order", {}) or {}
+    order_id     = order.get("order_id", "")
+    pickup_loc   = order.get("pickup_loc", "")
+    delivery_loc = order.get("delivery_loc", "")
+    broker_name  = order.get("broker_name", "")
+    lane = f"{pickup_loc} → {delivery_loc}" if pickup_loc and delivery_loc else ""
+
+    body_excerpt = (body or "").strip()
+    if len(body_excerpt) > 400:
+        body_excerpt = body_excerpt[:400].rstrip() + "…"
+
+    header_bits = [b for b in (f"Order #{order_id}" if order_id else "",
+                                broker_name, lane) if b]
+    header = "  ·  ".join(header_bits)
+
+    if result.get("updated"):
+        cls    = result.get("classification", {}) or {}
+        status = cls.get("status", "")
+        emoji  = _REPLY_STATUS_EMOJI.get(status, "✉️")
+        text = (f"{emoji} {status.upper()} — {header}\n"
+                f"“{cls.get('reason', '')}”\n\n"
+                f"{body_excerpt}")
+    else:
+        text = f"✉️ Reply — {header}\n\n{body_excerpt}"
+
+    mobile_url = build_gmail_thread_url(thread_id) if thread_id else None
+    send_to_telegram(text, open_url=mobile_url, open_url_text="OPEN THREAD")
+
+
 # The "what rate did you quote?" ForceReply prompt (and its reply-
 # matching handler in handle_bid_callbacks) was removed 2026-09-09 —
 # client feedback: dispatchers won't reliably type the rate back every
@@ -1588,7 +1644,7 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                         _subj_cls = _h.get("value", "")
                         break
                 threading.Thread(
-                    target=call_classify_reply,
+                    target=_run_classify_and_notify,
                     args=(ACTIVE_LICENSE_KEY, _get_machine_id(),
                           _thread_id_cls, _subj_cls, body),
                     daemon=True,
