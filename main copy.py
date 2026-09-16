@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-12e"
+BUILD_VERSION          = "2026-09-16a"
 
 BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
@@ -648,6 +648,31 @@ def authenticate_gmail():
 def build_gmail_thread_url(thread_id):
     return f"https://mail.google.com/mail/u/0/#all/{thread_id}"
 
+
+def _open_bid_thread(order_id: str, load: dict):
+    """
+    Open the exact Gmail thread for a BID PC/PHONE tap. Client-reported
+    (2026-09-14, real example — Order #332082): "when client tried BID
+    PC, it just redirected it to gmail, not the specific thread." Root
+    cause not fully pinned down (LOAD_STORE[order]["original_msg_full"]
+    should always carry a real threadId from Gmail's own API response —
+    it's never legitimately absent), but the OLD fallback for a missing
+    thread_id was "open the generic all-mail inbox", which is useless —
+    the dispatcher has to search for the order manually anyway. Falls
+    back to a Gmail SEARCH for the order number instead, which is a
+    real, usable substitute even without the exact thread_id, and logs
+    the miss so a repeat occurrence is diagnosable from the log file
+    instead of just "sometimes doesn't work."
+    """
+    thread_id = (load.get("original_msg_full") or {}).get("threadId", "")
+    if thread_id:
+        webbrowser.open(build_gmail_thread_url(thread_id))
+        return
+    msg = f"[BID-OPEN] order={order_id} has no original_msg_full.threadId — falling back to search"
+    print(msg)
+    _flog("warning", msg)
+    webbrowser.open(f"https://mail.google.com/mail/u/0/#search/{quote(str(order_id))}")
+
 def mark_as_read(service, msg_id):
     try:
         service.users().messages().modify(
@@ -1068,11 +1093,6 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
         return None
 
 
-# Emoji per classify_broker_reply() outcome — anything not in this map
-# (an unrecognized status, or no confident status at all) falls back to
-# a plain envelope in _run_classify_and_notify() below.
-_REPLY_STATUS_EMOJI = {"won": "✅", "lost": "❌", "countered": "🔄"}
-
 
 def _run_classify_and_notify(license_key: str, machine_id: str,
                              thread_id: str, subject: str, body: str):
@@ -1119,19 +1139,20 @@ def _run_classify_and_notify(license_key: str, machine_id: str,
         # the thread directly for anything genuinely ambiguous.
         return
 
-    # No raw reply excerpt — real bug, reported 2026-09-12 with a real
-    # example: a broker's reply signature block (name/phone/MC/DOT/
-    # address) PLUS the fully-quoted original bid text ("On ... wrote:
-    # > Rate: $1500...") were both getting dumped into the notification
-    # underneath the AI's own reason line, which already says what
-    # actually matters ("Broker proposes a lower rate of $1400 instead
-    # of the original $1500") — the raw excerpt was pure noise on top
-    # of that summary, not new information. Header + reason only now;
-    # the OPEN THREAD button below is how to read the real message.
-    cls    = result.get("classification", {}) or {}
-    status = cls.get("status", "")
-    emoji  = _REPLY_STATUS_EMOJI.get(status, "✉️")
-    text = f"{emoji} {status.upper()} — {header}\n“{cls.get('reason', '')}”"
+    # No status word (WON/LOST/COUNTERED) — real bug, reported
+    # 2026-09-14: the AI's classification isn't always right (a
+    # "reply" notification landing when the broker hadn't actually
+    # replied is the same underlying issue), so asserting a confident-
+    # sounding verdict risks telling the dispatcher they won or lost a
+    # load when that isn't actually established. Neutral "📩 Reply —"
+    # header now, matching the plain style of the other thread-activity
+    # ping (_notify_labeled_thread) — the AI's reason is still useful
+    # context (it's a description, not a verdict) and stays; no raw
+    # reply excerpt either (removed the same day for the same "just
+    # noise on top of the reason" logic). OPEN THREAD is how to read
+    # the real message and judge the outcome directly.
+    cls  = result.get("classification", {}) or {}
+    text = f"📩 Reply — {header}\n“{cls.get('reason', '')}”"
 
     mobile_url = build_gmail_thread_url(thread_id) if thread_id else None
     send_to_telegram(text, open_url=mobile_url, open_url_text="OPEN THREAD")
@@ -1296,11 +1317,7 @@ def handle_bid_callbacks(service):
                     continue
                 try:
                     pyperclip.copy(body)
-                    thread_id = load.get("original_msg_full", {}).get("threadId", "")
-                    if thread_id:
-                        webbrowser.open(build_gmail_thread_url(thread_id))
-                    else:
-                        webbrowser.open("https://mail.google.com/mail/u/0/#all")
+                    _open_bid_thread(order_id, load)
                     _bid_id = _record_bid(load, "pc", selected)
                     # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
                     # now fills in automatically via thread learning instead)
@@ -1316,11 +1333,7 @@ def handle_bid_callbacks(service):
                     continue
                 try:
                     pyperclip.copy(body)
-                    thread_id = load.get("original_msg_full", {}).get("threadId", "")
-                    if thread_id:
-                        webbrowser.open(build_gmail_thread_url(thread_id))
-                    else:
-                        webbrowser.open("https://mail.google.com/mail/u/0/#all")
+                    _open_bid_thread(order_id, load)
                     _bid_id = _record_bid(load, "pc")
                     # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
                     # now fills in automatically via thread learning instead)
