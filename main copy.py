@@ -201,13 +201,17 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-16a"
+BUILD_VERSION          = "2026-09-16b"
 
-BOT_TOKEN              = "8157082619:AAHqoxicji5_awWjDmd1Ia7FGxpgp2R6Vkc"
+# Rotated 2026-09-16 — the previous tokens leaked via the (now private)
+# public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
+# security-incident entry). Old dispatcher token confirmed dead via a
+# live getMe call (401 Unauthorized) before these were wired in.
+BOT_TOKEN              = "8157082619:AAETFqdzP_VOXPEoWmKi3Uq48CQuHNU_Z08"
 # Driver bot (2026-09-11) — a SEPARATE Telegram bot from BOT_TOKEN above,
 # so driver bid replies never mix into the dispatcher's own chat. Same
 # hardcoded-constant pattern as BOT_TOKEN itself (not a GUI field).
-DRIVER_BOT_TOKEN       = "8371628317:AAEEcVu0jnpKu9Zni3meYMSlcpRaanv1VhE"
+DRIVER_BOT_TOKEN       = "8371628317:AAFa9yNDSfT_aks_OPYn_GQPchuEwOGuxt8"
 TELEGRAM_UPDATE_OFFSET = 0
 TELEGRAM_OFFSET_LOCK   = threading.Lock()
 
