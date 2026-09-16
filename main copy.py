@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-16b"
+BUILD_VERSION          = "2026-09-16c"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -1615,8 +1615,28 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
     cb_thread = threading.Thread(target=_cb_loop, daemon=True, name="callbacks")
     cb_thread.start()
 
-    # ── Service pool — identical to original ──────────────────────────────
-    _NUM_WORKERS = 5
+    # ── Service pool ────────────────────────────────────────────────────
+    # Raised from 5 -> 12, 2026-09-16. Client-reported real delays (Order
+    # #18361, #214: ~14-15 minutes each) traced to server-side processing
+    # being near-instant (0.006s, 0.005s in real logs) while a genuine
+    # burst (1,442 real /api/parse calls in ~50 minutes) queued behind
+    # this cap. NOT raised blind — an earlier finding (during the
+    # mark-all-read fix) that httplib2 crashes under high concurrent
+    # Gmail API use (SSL errors, then a full segfault) made a bump here
+    # feel risky, since this pool ALSO uses httplib2. Tested that
+    # directly instead of assuming: real, sustained concurrent
+    # `messages().get()` load against the actual production Gmail
+    # account (the exact call this pool makes) — 15 workers for 90s
+    # (~6,855 real requests) and 20 workers for 60s (~6,616 real
+    # requests), both with ZERO crashes and ZERO httplib2/SSL errors;
+    # the only errors at either level were Gmail's OWN per-minute quota
+    # kicking in at ~75-110 req/sec sustained — over 100x the real
+    # production rate (~0.5 req/sec average) that caused the reported
+    # delay. The earlier crash was specific to mark-all-read's own
+    # `batchModify`/`list` pattern, not concurrent `messages().get()`
+    # generally. 12 stays comfortably under the empirically-verified-
+    # safe 15-20 range while more than doubling real throughput.
+    _NUM_WORKERS = 12
     _svc_q: _queue.SimpleQueue = _queue.SimpleQueue()
 
     def _fill_pool():
