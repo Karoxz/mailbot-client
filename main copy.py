@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-16c"
+BUILD_VERSION          = "2026-09-17a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -1098,37 +1098,63 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
 
 
 
+# Per-thread cooldown for reply classification — real bug, reported
+# 2026-09-17: a labeled/protected thread is deliberately kept unread
+# forever by _safe_mark_read() (so the dispatcher keeps seeing it in
+# their inbox), which means every automated message that lands in that
+# same thread (load-board reminders/reposts — not a real new broker
+# reply) gets fetched again on every poll and independently spawns its
+# own _run_classify_and_notify call. With no dedup here, a single
+# underlying event got reclassified and re-notified roughly once per
+# poll cycle, reported as "the same notification ~100 times... even
+# though the broker didn't reply." Same 5-minute cooldown window and
+# lock pattern as _notify_labeled_thread's, applied per thread_id
+# before ever calling the server (also saves the wasted LLM calls).
+_CLASSIFY_NOTIFY_COOLDOWN_SEC = 300  # 5 minutes
+_last_classify_attempt: dict = {}    # {thread_id: last-attempt unix time}
+_classify_attempt_lock = threading.Lock()
+
+
 def _run_classify_and_notify(license_key: str, machine_id: str,
                              thread_id: str, subject: str, body: str):
     """
-    Classify a broker's reply (won/lost/countered/no_signal) AND tell
-    the dispatcher a reply came in at all — real bug, reported
-    2026-09-12: the reply-guard fix from the day before (2026-09-11,
-    correctly stopping a reply from being re-parsed as a brand new
-    posting and resent 6x) had the side effect of going from "way too
-    many notifications" straight to "zero" — classify_broker_reply's
-    result was always silently discarded here, so a reply that changed
-    nothing about the message pipeline also told the dispatcher nothing
-    at all. This is now the ONLY place a reply notification comes from.
+    Classify a broker's reply (won/lost/countered/no_signal) so the
+    outcome gets recorded server-side (bid_history / the rate model) —
+    real bug, reported 2026-09-12: the reply-guard fix from the day
+    before (2026-09-11, correctly stopping a reply from being
+    re-parsed as a brand new posting and resent 6x) had the side
+    effect of going from "way too many notifications" straight to
+    "zero" — classify_broker_reply's result was always silently
+    discarded here.
+
+    Does NOT send its own Telegram message — real bug, reported
+    2026-09-17 (client, batch item 2): the AI's free-text "reason"
+    ("Broker proposes a different rate of $1300...") read as unwanted
+    commentary on top of the already-sufficient default "📌 Label /
+    📍 States" ping _notify_labeled_thread already sends for the same
+    reply event (same thread, same poll pass — see the STEP 3 guard in
+    _process_email). Client wants every bid-reply notification to look
+    exactly like that default, with no AI commentary and no WON/LOST/
+    COUNTERED wording — so this function classifies and records the
+    outcome (still useful, real data for the rate model) but stays
+    silent on Telegram; _notify_labeled_thread is the only notification
+    a bid reply produces now, matching "just like it is on default."
 
     Runs on its own thread (started by the caller) so it never delays
     the main polling loop — an LLM call on the server can take a few
     seconds.
     """
+    if thread_id:
+        now = time.time()
+        with _classify_attempt_lock:
+            last = _last_classify_attempt.get(thread_id, 0)
+            if now - last < _CLASSIFY_NOTIFY_COOLDOWN_SEC:
+                return
+            _last_classify_attempt[thread_id] = now
+
     result = call_classify_reply(license_key, machine_id, thread_id, subject, body)
     if not result or not result.get("matched"):
         return  # no bid on file for this thread — nothing to report
-
-    order = result.get("order", {}) or {}
-    order_id     = order.get("order_id", "")
-    pickup_loc   = order.get("pickup_loc", "")
-    delivery_loc = order.get("delivery_loc", "")
-    broker_name  = order.get("broker_name", "")
-    lane = f"{pickup_loc} → {delivery_loc}" if pickup_loc and delivery_loc else ""
-
-    header_bits = [b for b in (f"Order #{order_id}" if order_id else "",
-                                broker_name, lane) if b]
-    header = "  ·  ".join(header_bits)
 
     if not result.get("updated"):
         # No confident won/lost/countered signal — real bug, reported
@@ -1136,30 +1162,14 @@ def _run_classify_and_notify(license_key: str, machine_id: str,
         # a raw Sylectus repost/reminder in an already-bid thread (no
         # human reply content at all, just the same posting blurb again)
         # — genuinely nothing worth interrupting the dispatcher for.
-        # Silently drop it; only a confident classification below still
-        # sends. Trades away surfacing a genuinely-inconclusive HUMAN
-        # reply (rare) for not paging the dispatcher over load-board
-        # noise (apparently common) — the dispatcher can always check
-        # the thread directly for anything genuinely ambiguous.
         return
 
-    # No status word (WON/LOST/COUNTERED) — real bug, reported
-    # 2026-09-14: the AI's classification isn't always right (a
-    # "reply" notification landing when the broker hadn't actually
-    # replied is the same underlying issue), so asserting a confident-
-    # sounding verdict risks telling the dispatcher they won or lost a
-    # load when that isn't actually established. Neutral "📩 Reply —"
-    # header now, matching the plain style of the other thread-activity
-    # ping (_notify_labeled_thread) — the AI's reason is still useful
-    # context (it's a description, not a verdict) and stays; no raw
-    # reply excerpt either (removed the same day for the same "just
-    # noise on top of the reason" logic). OPEN THREAD is how to read
-    # the real message and judge the outcome directly.
-    cls  = result.get("classification", {}) or {}
-    text = f"📩 Reply — {header}\n“{cls.get('reason', '')}”"
-
-    mobile_url = build_gmail_thread_url(thread_id) if thread_id else None
-    send_to_telegram(text, open_url=mobile_url, open_url_text="OPEN THREAD")
+    order = result.get("order", {}) or {}
+    cls   = result.get("classification", {}) or {}
+    print(f"[CLASSIFY] thread={thread_id} order={order.get('order_id', '')} "
+          f"status={cls.get('status', '')} reason={cls.get('reason', '')!r} "
+          f"(outcome recorded server-side; no separate Telegram message — "
+          f"see 2026-09-17 docstring note)")
 
 
 # The "what rate did you quote?" ForceReply prompt (and its reply-
