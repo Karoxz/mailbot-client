@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-17a"
+BUILD_VERSION          = "2026-09-17b"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -1626,27 +1626,47 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
     cb_thread.start()
 
     # ── Service pool ────────────────────────────────────────────────────
-    # Raised from 5 -> 12, 2026-09-16. Client-reported real delays (Order
-    # #18361, #214: ~14-15 minutes each) traced to server-side processing
-    # being near-instant (0.006s, 0.005s in real logs) while a genuine
-    # burst (1,442 real /api/parse calls in ~50 minutes) queued behind
-    # this cap. NOT raised blind — an earlier finding (during the
-    # mark-all-read fix) that httplib2 crashes under high concurrent
-    # Gmail API use (SSL errors, then a full segfault) made a bump here
-    # feel risky, since this pool ALSO uses httplib2. Tested that
-    # directly instead of assuming: real, sustained concurrent
-    # `messages().get()` load against the actual production Gmail
-    # account (the exact call this pool makes) — 15 workers for 90s
-    # (~6,855 real requests) and 20 workers for 60s (~6,616 real
-    # requests), both with ZERO crashes and ZERO httplib2/SSL errors;
-    # the only errors at either level were Gmail's OWN per-minute quota
-    # kicking in at ~75-110 req/sec sustained — over 100x the real
-    # production rate (~0.5 req/sec average) that caused the reported
-    # delay. The earlier crash was specific to mark-all-read's own
-    # `batchModify`/`list` pattern, not concurrent `messages().get()`
-    # generally. 12 stays comfortably under the empirically-verified-
-    # safe 15-20 range while more than doubling real throughput.
-    _NUM_WORKERS = 12
+    # Raised from 5 -> 12 on 2026-09-16, then 12 -> 20 on 2026-09-17 —
+    # both increases backed by real load testing, not guessed.
+    #
+    # 2026-09-16 (5->12): client-reported real delays (Order #18361,
+    # #214: ~14-15 minutes each) traced to server-side processing being
+    # near-instant (0.006s, 0.005s in real logs) while a genuine burst
+    # (1,442 real /api/parse calls in ~50 minutes) queued behind this
+    # cap. NOT raised blind — an earlier finding (during the mark-all-
+    # read fix) that httplib2 crashes under high concurrent Gmail API
+    # use (SSL errors, then a full segfault) made a bump here feel
+    # risky, since this pool ALSO uses httplib2. Tested directly
+    # instead of assuming: 15 workers for 90s (~6,855 requests) and 20
+    # workers for 60s (~6,616 requests) against the real production
+    # Gmail account, both ZERO crashes / ZERO httplib2 errors; only
+    # Gmail's per-minute quota kicking in at ~75-110 req/sec (100x real
+    # production rate). The earlier crash was specific to mark-all-
+    # read's own `batchModify`/`list` pattern, not `messages().get()`.
+    #
+    # 2026-09-17 (12->20): re-verified the 2026-09-16 fix against a
+    # fresh real delay report (orders #34339, #319779) — actual delays
+    # were ~2m21s/~6m47s, a real improvement over the pre-fix ~14-15min
+    # but still real, and journalctl confirmed the same intensity burst
+    # (893 real /api/parse calls in 30 minutes, ~30/min sustained) that
+    # originally caused the problem — client confirmed bursts this size
+    # are common and can go higher. Re-ran the same load test further:
+    # 20 workers for 45s -> 1,029/1,029 succeeded, ZERO errors of any
+    # kind. 25 workers for 60s surfaced a DIFFERENT Gmail quota this
+    # project hadn't seen before — "Too many concurrent requests for
+    # user" (still 429, but concurrency-based, not the per-minute one)
+    # — on ~6% of calls (85/1,356), still zero crashes. So 25 is where
+    # Gmail's own concurrent-request ceiling starts on this account; 20
+    # stays clear of it while still being the top of the previously-
+    # tested-safe range. Also closed a real gap surfaced by this same
+    # testing: a 429 hitting _process_email fell through to the plain
+    # non-retried error path, and the message got marked "processed"
+    # regardless — i.e. any rate-limit hit, not just a crash, silently
+    # dropped that email forever. Fixed by making _is_rate_limited()
+    # retry through the same backoff path as a connection reset (see
+    # its own docstring) — this protects at ANY worker count, not just
+    # a high one.
+    _NUM_WORKERS = 20
     _svc_q: _queue.SimpleQueue = _queue.SimpleQueue()
 
     def _fill_pool():
@@ -1699,6 +1719,30 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                 return True
         if "10054" in str(exc) or "ConnectionReset" in type(exc).__name__:
             return True
+        return False
+
+    # Real gap, found 2026-09-17 while load-testing a higher _NUM_WORKERS:
+    # a Gmail 429 (either the per-minute quota, or the separate
+    # "Too many concurrent requests for user" cap that empirically shows
+    # up around 25+ concurrent workers on this same account) was falling
+    # into the plain `else: _log(...)` branch below — NOT retried, since
+    # only _is_conn_reset() triggered a retry. Worse than a delay: after
+    # the except-block returns, `_reap_futures()` unconditionally adds
+    # the msg_id to `processed_ids` regardless of success, so a message
+    # that happened to hit either 429 would be marked "handled" and
+    # silently dropped forever — never reprocessed on a later poll, no
+    # Telegram notification, nothing. A real freight posting could
+    # vanish with zero trace. Retrying a transient rate-limit exactly
+    # like a connection reset (same backoff, same attempt cap) closes
+    # this regardless of what _NUM_WORKERS is set to — it's the correct
+    # safety net for any concurrency level, not just a high one.
+    def _is_rate_limited(exc: Exception) -> bool:
+        if isinstance(exc, HttpError):
+            status = getattr(exc.resp, "status", None)
+            if status == 429:
+                return True
+            if status == 403 and "rateLimitExceeded" in str(exc):
+                return True
         return False
 
     def _process_email(msg_id: str):
@@ -1899,20 +1943,25 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                             label_map, _subject_final, _log)
 
         except Exception as e:
-            if _is_conn_reset(e) and not STOP_EVENT.is_set():
+            # Rate-limit retries share the connection-reset path — real
+            # gap found 2026-09-17 (see _is_rate_limited's docstring):
+            # without this, a 429 fell straight to the plain else branch
+            # and the message was silently dropped forever.
+            if (_is_conn_reset(e) or _is_rate_limited(e)) and not STOP_EVENT.is_set():
+                kind = "RateLimit" if _is_rate_limited(e) else "ConnReset"
                 attempt = _retry_counts.get(msg_id, 0) + 1
                 if attempt <= _MAX_CONN_RETRIES:
                     _retry_counts[msg_id] = attempt
                     wait = 2 ** attempt
                     _log(f"[{datetime.now().strftime('%H:%M:%S')}] "
-                         f"⚠ ConnReset {msg_id[-6:]} — retry {attempt}/{_MAX_CONN_RETRIES} in {wait}s")
+                         f"⚠ {kind} {msg_id[-6:]} — retry {attempt}/{_MAX_CONN_RETRIES} in {wait}s")
                     time.sleep(wait)
                     with in_flight_lock:
                         in_flight.discard(msg_id)
                     _submit(msg_id)
                     return
                 _log(f"[{datetime.now().strftime('%H:%M:%S')}] "
-                     f"❌ {msg_id[-6:]}: ConnReset after {_MAX_CONN_RETRIES} retries — giving up")
+                     f"❌ {msg_id[-6:]}: {kind} after {_MAX_CONN_RETRIES} retries — giving up")
             else:
                 _log(f"[ERR] {msg_id[-6:]}: {e}")
         finally:
