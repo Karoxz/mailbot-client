@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-17b"
+BUILD_VERSION          = "2026-09-18a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -317,6 +317,33 @@ def parse_weight_lbs(weight_text):
     except ValueError:
         return None
 
+def parse_loaded_miles_range(raw: str):
+    """
+    Parses the per-truck LOADED_MILES_RANGE field (2026-09-18) — a
+    restriction on the LOAD's own loaded miles (pickup->delivery
+    distance), separate from RADIUS (truck->pickup deadhead). "1000"
+    (a single number) means 1000 miles and up, no cap. "1000-2000"
+    means an inclusive range. Blank/unparseable -> (None, None), same
+    "optional field, blank = no restriction" pattern as RADIUS/CHAT_ID.
+    Returns (min, max).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    if "-" in raw:
+        lo_s, _, hi_s = raw.partition("-")
+        lo = parse_weight_lbs(lo_s)
+        hi = parse_weight_lbs(hi_s)
+        if lo is None or hi is None:
+            return None, None
+        if lo > hi:
+            lo, hi = hi, lo
+        return lo, hi
+    lo = parse_weight_lbs(raw)
+    if lo is None:
+        return None, None
+    return lo, None
+
 def parse_height_from_dims(dims: str):
     if not dims:
         return None
@@ -396,6 +423,13 @@ def parse_truck_definitions(text):
                 telegram_chat_id = int(chatid_raw.strip())
             except ValueError:
                 telegram_chat_id = None
+        # LOADED_MILES_RANGE (2026-09-18) — optional 11th field, this
+        # vehicle's restriction on the LOAD's own loaded miles (pickup->
+        # delivery distance), separate from RADIUS (truck->pickup
+        # deadhead). "1000" = 1000 miles and up; "1000-2000" = inclusive
+        # range; blank = no restriction. See parse_loaded_miles_range().
+        loaded_miles_raw = parts[10] if len(parts) > 10 else ""
+        loaded_miles_min, loaded_miles_max = parse_loaded_miles_range(loaded_miles_raw)
         truck_states = expand_states(states_raw) if states_raw.strip() else None
         trucks.append({
             "vehicle":         vehicle.upper(),
@@ -409,6 +443,8 @@ def parse_truck_definitions(text):
             "equipment":       equipment,
             "radius_miles":    radius_miles,
             "telegram_chat_id": telegram_chat_id,
+            "loaded_miles_min": loaded_miles_min,
+            "loaded_miles_max": loaded_miles_max,
         })
     return trucks
 
@@ -457,6 +493,13 @@ def validate_truck_definitions(text):
             except ValueError:
                 errors.append(f"Line {i}: chat ID '{parts[9]}' must be a whole number "
                                f"(get it from @userinfobot on Telegram)")
+        if len(parts) > 10 and parts[10].strip():
+            lm_min, lm_max = parse_loaded_miles_range(parts[10])
+            if lm_min is None:
+                errors.append(
+                    f"Line {i}: cannot parse loaded miles range '{parts[10]}' — "
+                    f"use a single number (1000) or a range (1000-2000)"
+                )
     return errors
 
 # =============================================================
@@ -1853,6 +1896,8 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
                     "allowed_states":  list(t["allowed_states"]) if t.get("allowed_states") else None,
                     "pickup_date":     t.get("pickup_date", ""),
                     "radius_miles":    t.get("radius_miles"),
+                    "loaded_miles_min": t.get("loaded_miles_min"),
+                    "loaded_miles_max": t.get("loaded_miles_max"),
                 })
 
             _T2 = time.perf_counter()
@@ -2986,7 +3031,7 @@ def create_app():
 
     # ── TRUCKS SECTION ────────────────────────────────────────────────────
     trk_sec = _section(cfg_pane,
-        "🚛  TRUCKS  ·  VEHICLE:DRIVER:DIMS:PAYLOAD:EQUIPMENT:STATES:ZIP[:DATE[:RADIUS[:CHAT_ID]]]")
+        "🚛  TRUCKS  ·  VEHICLE:DRIVER:DIMS:PAYLOAD:EQUIPMENT:STATES:ZIP[:DATE[:RADIUS[:CHAT_ID[:LOADED_MILES]]]]")
 
     guide_frame = tk.Frame(trk_sec, bg=_C["input"], padx=8, pady=6)
     guide_frame.pack(fill="x", pady=(0, 6))
@@ -2997,12 +3042,12 @@ def create_app():
              bg=_C["input"], fg=_C["accent"],
              font=("Segoe UI", 10, "bold")).pack(anchor="w")
     tk.Label(guide_frame,
-             text="VEHICLE : DRIVER : LxWxH : MAX LBS : EQUIPMENT : STATES : ZIP : DATE : RADIUS : CHAT_ID",
+             text="VEHICLE : DRIVER : LxWxH : MAX LBS : EQUIPMENT : STATES : ZIP : DATE : RADIUS : CHAT_ID : LOADED_MILES",
              bg=_C["input"], fg=_C["text"],
              font=("Consolas", 10)).pack(anchor="w", pady=(2, 2))
     tk.Label(guide_frame,
              text="Example:  LARGE STRAIGHT:John Smith:264x97x103:26000"
-                  ":Dock High,Air Ride:OH,PA,NY:44129:05/29/26:150:111222333",
+                  ":Dock High,Air Ride:OH,PA,NY:44129:05/29/26:150:111222333:1000-2000",
              bg=_C["input"], fg=_C["green"],
              font=("Consolas", 10)).pack(anchor="w")
     tk.Label(guide_frame,
@@ -3015,6 +3060,11 @@ def create_app():
     tk.Label(guide_frame,
              text="CHAT_ID: this driver's own Telegram chat ID with the driver "
                   "bot — blank = driver bot skips them  |  get it from @userinfobot",
+             bg=_C["input"], fg=_C["text"],
+             font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
+    tk.Label(guide_frame,
+             text="LOADED_MILES: blank = any distance  |  \"1000\" = 1000mi and up  |  "
+                  "\"1000-2000\" = between 1000 and 2000mi",
              bg=_C["input"], fg=_C["text"],
              font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
 
@@ -3041,7 +3091,11 @@ def create_app():
              "CHAT_ID   — optional, this driver's own Telegram chat ID "
              "— set it and the driver bot sends them load cards and "
              "lets them tap BID; blank = driver bot skips them. Get a "
-             "driver's chat ID by having them message @userinfobot")
+             "driver's chat ID by having them message @userinfobot\n"
+             "LOADED_MILES — optional, restricts this truck to loads of "
+             "a certain length. \"1000\" = 1000 miles and up, no cap. "
+             "\"1000-2000\" = only loads between 1000 and 2000 miles. "
+             "Blank = any distance")
 
     # ── Load persisted config ─────────────────────────────────────────────
     _cfg = _load_config()
