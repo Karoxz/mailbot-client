@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-18a"
+BUILD_VERSION          = "2026-09-18b"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -3096,6 +3096,247 @@ def create_app():
              "a certain length. \"1000\" = 1000 miles and up, no cap. "
              "\"1000-2000\" = only loads between 1000 and 2000 miles. "
              "Blank = any distance")
+
+    # ── ADD / EDIT / DELETE TRUCK DIALOG (2026-09-18) ───────────────────────
+    # Real feedback: hand-typing the colon-delimited line above (remembering
+    # field order, using blank placeholders to skip an earlier optional
+    # field while setting a later one) was confusing for new clients. This
+    # form collects the same fields with labels + validation and builds the
+    # line FOR you. The text box above stays the actual source of truth —
+    # nothing else in the app changes, and anyone who prefers to bulk
+    # paste/edit raw lines still can.
+    def _split_truck_line_raw(line: str) -> list:
+        parts = [p.strip() for p in (line or "").split(":")]
+        parts += [""] * (11 - len(parts))
+        return parts[:11]
+
+    def _build_truck_line_from_fields(vehicle, driver, dims, payload, equipment,
+                                       states, zip_loc, date, radius, chat_id,
+                                       loaded_miles) -> str:
+        parts = [vehicle, driver, dims, payload, equipment, states,
+                 zip_loc, date, radius, chat_id, loaded_miles]
+        # Trim purely-trailing blank optional fields so a truck that only
+        # sets the required 4 fields doesn't end up with 7 stray colons.
+        while len(parts) > 4 and not parts[-1]:
+            parts.pop()
+        return ":".join(parts)
+
+    def _current_truck_line_no() -> int:
+        return int(t_box.index("insert").split(".")[0])
+
+    def _open_truck_dialog(edit_line_no=None):
+        is_edit = edit_line_no is not None
+        raw = [""] * 11
+        if is_edit:
+            line_text = t_box.get(f"{edit_line_no}.0", f"{edit_line_no}.end").strip()
+            if not line_text:
+                messagebox.showerror(
+                    "Edit Truck",
+                    "Click into a truck line in the box below first, then click Edit."
+                )
+                return
+            raw = _split_truck_line_raw(line_text)
+
+        win = tk.Toplevel(root)
+        win.title("Edit Truck" if is_edit else "Add Truck")
+        win.configure(bg=_C["bg"])
+        win.resizable(False, False)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = 480, 600
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        win.transient(root)
+
+        outer = tk.Frame(win, bg=_C["bg"])
+        outer.pack(fill="both", expand=True, padx=16, pady=14)
+
+        tk.Label(outer, text=("✏️  EDIT TRUCK" if is_edit else "➕  ADD TRUCK"),
+                 bg=_C["bg"], fg=_C["text"],
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 10))
+
+        body = tk.Frame(outer, bg=_C["bg"])
+        body.pack(fill="both", expand=True)
+
+        def _row(label, default="", tooltip="", required=False):
+            r = tk.Frame(body, bg=_C["bg"])
+            r.pack(fill="x", pady=3)
+            lb = tk.Label(r, text=label + (" *" if required else ""),
+                          bg=_C["bg"], fg=_C["text"],
+                          font=("Segoe UI", 10), width=15, anchor="w")
+            lb.pack(side="left")
+            e = tk.Entry(r, bg=_C["input"], fg=_C["text"],
+                        insertbackground=_C["text"], relief="flat",
+                        font=("Segoe UI", 10), highlightthickness=1,
+                        highlightbackground=_C["border"], highlightcolor=_C["accent"])
+            e.insert(0, default)
+            e.pack(side="left", fill="x", expand=True, ipady=4)
+            if tooltip:
+                _Tooltip(e, tooltip)
+                _Tooltip(lb, tooltip)
+            return e
+
+        vehicle_e = _row("Vehicle Type", raw[0], required=True,
+            tooltip="Must match one of the Vehicle Types configured above,\ne.g. LARGE STRAIGHT")
+        driver_e  = _row("Driver Name", raw[1], required=True)
+        dims_e    = _row("Dimensions", raw[2], required=True,
+            tooltip="Length x Width x Height in inches, e.g. 264x97x103")
+        payload_e = _row("Max Payload", raw[3], required=True,
+            tooltip="Max weight in lbs, e.g. 26000")
+        equip_e   = _row("Equipment", raw[4],
+            tooltip="e.g. Dock High, Air Ride, Lift Gate — leave blank if none")
+        states_e  = _row("Allowed States", raw[5],
+            tooltip="Blank = all states.\nCodes: OH,PA,NY — or regions: East Coast, Midwest, West Coast")
+        zip_e     = _row("ZIP / Location", raw[6], required=True,
+            tooltip="Truck's current location — needed to match it to nearby loads")
+        date_e    = _row("Pickup Date", raw[7],
+            tooltip="Optional. Format MM/DD/YY — blank = available any date")
+        radius_e  = _row("Max Radius (mi)", raw[8],
+            tooltip="Optional. This truck's own max deadhead distance —\nblank uses the Max Radius setting above")
+        chatid_e  = _row("Driver Chat ID", raw[9],
+            tooltip="Optional. This driver's own Telegram chat ID with the\ndriver bot — get it from @userinfobot. Blank = driver bot skips them")
+        loaded_e  = _row("Loaded Miles", raw[10],
+            tooltip="Optional. \"1000\" = 1000 miles and up.\n\"1000-2000\" = only loads in that range. Blank = any distance")
+
+        tk.Label(body, text="* required — everything else is optional",
+                 bg=_C["bg"], fg=_C["text3"],
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
+
+        btn_f = tk.Frame(outer, bg=_C["bg"])
+        btn_f.pack(fill="x", pady=(14, 0), side="bottom")
+
+        def _save():
+            vehicle = vehicle_e.get().strip()
+            driver  = driver_e.get().strip()
+            dims    = dims_e.get().strip()
+            payload = payload_e.get().strip()
+            equip   = equip_e.get().strip()
+            states  = states_e.get().strip()
+            zip_loc = zip_e.get().strip()
+            date    = date_e.get().strip()
+            radius  = radius_e.get().strip()
+            chat_id = chatid_e.get().strip()
+            loaded  = loaded_e.get().strip()
+
+            errs = []
+            if not vehicle:
+                errs.append("Vehicle Type is required")
+            if not driver:
+                errs.append("Driver Name is required")
+            if not dims:
+                errs.append("Dimensions is required")
+            if not payload:
+                errs.append("Max Payload is required")
+            elif parse_weight_lbs(payload) is None:
+                errs.append(f"Cannot parse Max Payload '{payload}' as a number")
+            if not zip_loc:
+                errs.append("ZIP / Location is required")
+            if states and not expand_states(states):
+                errs.append(
+                    f"Cannot expand Allowed States '{states}' — use state "
+                    f"codes (OH,PA) or region names (East Coast, Midwest, West Coast)"
+                )
+            if date:
+                valid = False
+                for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+                    try:
+                        datetime.strptime(date, fmt)
+                        valid = True
+                        break
+                    except ValueError:
+                        pass
+                if not valid:
+                    errs.append(f"Pickup Date '{date}' must be MM/DD/YYYY or MM/DD/YY")
+            if radius and parse_weight_lbs(radius) is None:
+                errs.append(f"Cannot parse Max Radius '{radius}' as a number")
+            if chat_id:
+                try:
+                    int(chat_id)
+                except ValueError:
+                    errs.append(f"Driver Chat ID '{chat_id}' must be a whole "
+                                 f"number (get it from @userinfobot)")
+            if loaded:
+                lm_min, _lm_max = parse_loaded_miles_range(loaded)
+                if lm_min is None:
+                    errs.append(
+                        f"Cannot parse Loaded Miles '{loaded}' — use a single "
+                        f"number (1000) or a range (1000-2000)"
+                    )
+
+            if errs:
+                messagebox.showerror(
+                    "Edit Truck" if is_edit else "Add Truck",
+                    "\n".join(f"•  {e}" for e in errs)
+                )
+                return
+
+            line = _build_truck_line_from_fields(
+                vehicle.upper(), driver, dims, payload, equip, states,
+                zip_loc, date.upper(), radius, chat_id, loaded
+            )
+
+            if is_edit:
+                t_box.delete(f"{edit_line_no}.0", f"{edit_line_no}.end")
+                t_box.insert(f"{edit_line_no}.0", line)
+            else:
+                existing = t_box.get("1.0", "end").strip()
+                t_box.insert("end", ("\n" if existing else "") + line)
+
+            win.destroy()
+
+        tk.Button(btn_f, text=("💾  Save Changes" if is_edit else "💾  Add Truck"),
+                  command=_save, bg="#1a7f4b", fg="#ffffff",
+                  activebackground="#22a05e", activeforeground="#ffffff",
+                  font=("Segoe UI", 10, "bold"), relief="flat",
+                  padx=16, pady=7, cursor="hand2").pack(side="left", padx=(0, 8))
+        tk.Button(btn_f, text="Cancel", command=win.destroy,
+                  bg=_C["input"], fg=_C["text2"],
+                  activebackground=_C["border"], activeforeground=_C["text"],
+                  font=("Segoe UI", 10), relief="flat",
+                  padx=12, pady=7, cursor="hand2").pack(side="left")
+
+        win.grab_set()
+        win.focus_set()
+        vehicle_e.focus_set()
+
+    def _edit_selected_truck():
+        _open_truck_dialog(edit_line_no=_current_truck_line_no())
+
+    def _delete_selected_truck():
+        line_no   = _current_truck_line_no()
+        line_text = t_box.get(f"{line_no}.0", f"{line_no}.end").strip()
+        if not line_text:
+            messagebox.showerror(
+                "Delete Truck",
+                "Click into a truck line in the box below first, then click Delete."
+            )
+            return
+        if not messagebox.askyesno("Delete Truck", f"Delete this truck?\n\n{line_text}"):
+            return
+        t_box.delete(f"{line_no}.0", f"{line_no + 1}.0")
+
+    truck_btn_row = tk.Frame(trk_sec, bg=_C["surf"])
+    truck_btn_row.pack(fill="x", pady=(6, 0))
+    _all_frames.append((truck_btn_row, "surf"))
+
+    tk.Label(truck_btn_row,
+             text="New here? Use these buttons instead of typing the format above —",
+             bg=_C["surf"], fg=_C["text3"],
+             font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 4))
+
+    _add_truck_btn = _btn(truck_btn_row, "➕  Add Truck",
+        lambda: _open_truck_dialog(), "#1a7f4b", fg="#ffffff",
+        hover="#22a05e", size="sm", side="left", padx=(0, 6))
+    _edit_truck_btn = _btn(truck_btn_row, "✏️  Edit Selected Line",
+        _edit_selected_truck, "#1c3d6b", fg="#ffffff",
+        hover="#199cc4", size="sm", side="left", padx=(0, 6))
+    _del_truck_btn = _btn(truck_btn_row, "🗑  Delete Selected Line",
+        _delete_selected_truck, "#6b1c1c", fg="#ffffff",
+        hover="#9c2a2a", size="sm", side="left")
+    _Tooltip(_add_truck_btn, "Opens a form to add a new truck — no need to\n"
+                              "remember the field order or type colons by hand.")
+    _Tooltip(_edit_truck_btn, "Click your cursor onto a truck line below, then\n"
+                               "click here to edit it through the same form.")
+    _Tooltip(_del_truck_btn, "Click your cursor onto a truck line below, then\n"
+                              "click here to remove it.")
 
     # ── Load persisted config ─────────────────────────────────────────────
     _cfg = _load_config()
