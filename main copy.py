@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-18b"
+BUILD_VERSION          = "2026-09-18c"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -3140,10 +3140,21 @@ def create_app():
         win = tk.Toplevel(root)
         win.title("Edit Truck" if is_edit else "Add Truck")
         win.configure(bg=_C["bg"])
-        win.resizable(False, False)
+        win.resizable(True, True)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        w, h = 480, 600
-        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        # Real bug, reported 2026-09-18 (screenshot): a hardcoded 480x600
+        # with resizable(False, False) and no scroll fallback meant the
+        # dialog ran edge-to-edge on a smaller/scaled screen — h is now
+        # capped to the actual screen height (minus room for the taskbar/
+        # title bar), the window can be resized/moved if still too small,
+        # and the field list scrolls internally so nothing is ever
+        # unreachable regardless of display size.
+        w = 460
+        h = min(620, sh - 100)
+        x = (sw - w) // 2
+        y = max(20, (sh - h) // 2 - 20)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.minsize(380, 320)
         win.transient(root)
 
         outer = tk.Frame(win, bg=_C["bg"])
@@ -3153,12 +3164,47 @@ def create_app():
                  bg=_C["bg"], fg=_C["text"],
                  font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 10))
 
-        body = tk.Frame(outer, bg=_C["bg"])
-        body.pack(fill="both", expand=True)
+        # Buttons packed BEFORE the scrollable field area below — same
+        # "reserve bottom space first" pattern _open_bid_template already
+        # uses for its own scrollable panel, and the direct fix for the
+        # edge-to-edge bug above: Save/Cancel now always have their space
+        # regardless of how tall the field list ends up being.
+        btn_f = tk.Frame(outer, bg=_C["bg"])
+        btn_f.pack(fill="x", pady=(10, 0), side="bottom")
+
+        body_outer = tk.Frame(outer, bg=_C["bg"])
+        body_outer.pack(fill="both", expand=True)
+
+        body_canvas = tk.Canvas(body_outer, bg=_C["bg"], highlightthickness=0)
+        body_vsb = tk.Scrollbar(body_outer, orient="vertical",
+                                command=body_canvas.yview, width=8)
+        body_canvas.configure(yscrollcommand=body_vsb.set)
+        body_vsb.pack(side="right", fill="y")
+        body_canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(body_canvas, bg=_C["bg"])
+        body_win = body_canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _body_resize(e):
+            body_canvas.itemconfig(body_win, width=e.width)
+
+        def _body_scroll(e):
+            body_canvas.configure(scrollregion=body_canvas.bbox("all"))
+
+        body_canvas.bind("<Configure>", _body_resize)
+        body.bind("<Configure>", _body_scroll)
+
+        def _body_mousewheel(e):
+            body_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        body_canvas.bind("<Enter>",
+                         lambda e: body_canvas.bind_all("<MouseWheel>", _body_mousewheel))
+        body_canvas.bind("<Leave>",
+                         lambda e: body_canvas.unbind_all("<MouseWheel>"))
 
         def _row(label, default="", tooltip="", required=False):
             r = tk.Frame(body, bg=_C["bg"])
-            r.pack(fill="x", pady=3)
+            r.pack(fill="x", pady=2)
             lb = tk.Label(r, text=label + (" *" if required else ""),
                           bg=_C["bg"], fg=_C["text"],
                           font=("Segoe UI", 10), width=15, anchor="w")
@@ -3168,7 +3214,7 @@ def create_app():
                         font=("Segoe UI", 10), highlightthickness=1,
                         highlightbackground=_C["border"], highlightcolor=_C["accent"])
             e.insert(0, default)
-            e.pack(side="left", fill="x", expand=True, ipady=4)
+            e.pack(side="left", fill="x", expand=True, ipady=3)
             if tooltip:
                 _Tooltip(e, tooltip)
                 _Tooltip(lb, tooltip)
@@ -3198,10 +3244,7 @@ def create_app():
 
         tk.Label(body, text="* required — everything else is optional",
                  bg=_C["bg"], fg=_C["text3"],
-                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 0))
-
-        btn_f = tk.Frame(outer, bg=_C["bg"])
-        btn_f.pack(fill="x", pady=(14, 0), side="bottom")
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(6, 2))
 
         def _save():
             vehicle = vehicle_e.get().strip()
