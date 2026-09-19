@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19b"
+BUILD_VERSION          = "2026-09-19c"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -753,18 +753,51 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     if _APP_ROOT is None:
         return
 
-    win = tk.Toplevel(_APP_ROOT)
-    win.title(f"Bid — Order #{order_id}")
-    win.configure(bg=_C["bg"])
-    win.resizable(True, True)
-    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-    w = 420
-    h = min(640, sh - 100)
-    x = (sw - w) // 2
-    y = max(20, (sh - h) // 2 - 20)
-    win.geometry(f"{w}x{h}+{x}+{y}")
-    win.minsize(360, 420)
-    win.transient(_APP_ROOT)
+    # Real bug, reported 2026-09-19: "pressed BID PC, nothing happened,
+    # then I couldn't open the app" -- BID PC is pressed from Telegram,
+    # not from inside the desktop app, so the dispatcher's normal
+    # workflow has the desktop window minimized/backgrounded at the
+    # exact moment this fires. A `transient()` Toplevel opened on top
+    # of a MINIMIZED parent can end up not actually visible (Windows'
+    # focus-stealing prevention for a window whose owner isn't the
+    # foreground process), while `grab_set()` below still redirects
+    # ALL input to that invisible window -- the whole app reads as
+    # frozen with no visible cause. Restoring/raising the main window
+    # FIRST, and forcing the new dialog to the foreground itself
+    # (temporary topmost + focus_force, not just lift/transient, which
+    # Windows can still ignore for a background-process-owned window)
+    # closes that gap. Wrapped in try/except so a failure here can
+    # never leave a half-built grab stuck on screen.
+    try:
+        if _APP_ROOT.state() == "iconic":
+            _APP_ROOT.deiconify()
+        _APP_ROOT.lift()
+        # update() (not just update_idletasks()) forces Tk to actually
+        # process the deiconify/lift through the window manager before
+        # the Toplevel below is created — real bug found testing this
+        # exact fix: without it, a Toplevel created immediately after
+        # deiconify() could still come back IsWindowVisible()=False,
+        # because Tk's own state had changed but Windows hadn't been
+        # told yet, so the new owned window inherited the stale hidden
+        # state. This is the actual fix for "nothing happened" above,
+        # not just extra caution.
+        _APP_ROOT.update()
+
+        win = tk.Toplevel(_APP_ROOT)
+        win.title(f"Bid — Order #{order_id}")
+        win.configure(bg=_C["bg"])
+        win.resizable(True, True)
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w = 420
+        h = min(640, sh - 100)
+        x = (sw - w) // 2
+        y = max(20, (sh - h) // 2 - 20)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+        win.minsize(360, 420)
+        win.transient(_APP_ROOT)
+    except Exception as e:
+        print(f"[BID-DIALOG] failed to open: {e}")
+        return
 
     outer = tk.Frame(win, bg=_C["bg"])
     outer.pack(fill="both", expand=True, padx=16, pady=14)
@@ -885,10 +918,30 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
               activeforeground=_C["text"], font=("Segoe UI", 10), relief="flat",
               padx=12, pady=6, cursor="hand2").pack(fill="x", pady=(6, 0))
 
-    win.grab_set()
-    win.focus_set()
-    price_e.focus_set()
-    price_e.icursor("end")
+    try:
+        win.deiconify()
+        win.lift()
+        win.update()  # flush deiconify/lift before the topmost/focus calls below
+        # Temporary topmost is the part that actually beats Windows'
+        # focus-stealing prevention for a window opened by a background
+        # thread's callback — lift()/transient() alone were not enough
+        # (see this function's docstring). Cleared 300ms later so it
+        # doesn't stay pinned above every other window indefinitely.
+        win.attributes("-topmost", True)
+        win.after(300, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
+        win.focus_force()
+        win.update()
+        # Deliberately NOT grab_set() — real incident, 2026-09-19: a
+        # modal grab on a window that (for any reason, anticipated or
+        # not) fails to actually become visible/focused redirects ALL
+        # app input to something the user can't see or reach, which is
+        # indistinguishable from the whole app being frozen. Losing the
+        # "can't click the main window while this is open" nicety is a
+        # much smaller cost than that failure mode recurring.
+        price_e.focus_set()
+        price_e.icursor("end")
+    except Exception as e:
+        print(f"[BID-DIALOG] failed to focus: {e}")
 
 
 def mark_as_read(service, msg_id):
