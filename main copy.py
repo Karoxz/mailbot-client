@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19d"
+BUILD_VERSION          = "2026-09-19e"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -788,15 +788,17 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         win.configure(bg=_C["bg"])
         win.resizable(True, True)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        # Widened + the map area enlarged (2026-09-19, client feedback:
-        # "the map needs to be much more bigger so its clearly visible")
-        # — bumped from 420x170 to 520x320 for the map itself.
-        w = 520
-        h = min(760, sh - 100)
+        # Widened + the map area enlarged (2026-09-19, client feedback,
+        # twice: "much more bigger", then "still needs to be bigger"
+        # after the first bump) — 420x170 -> 520x320 -> 640x480 for the
+        # map itself. Going meaningfully bigger this round rather than
+        # another small increment.
+        w = 640
+        h = min(920, sh - 100)
         x = (sw - w) // 2
         y = max(20, (sh - h) // 2 - 20)
         win.geometry(f"{w}x{h}+{x}+{y}")
-        win.minsize(420, 480)
+        win.minsize(480, 600)
         win.transient(_APP_ROOT)
     except Exception as e:
         print(f"[BID-DIALOG] failed to open: {e}")
@@ -828,8 +830,9 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
 
     # ── Route map — fetched in the background, dialog opens instantly
     # rather than blocking on a network round trip. Enlarged 2026-09-19
-    # per client feedback ("needs to be much more bigger") ─────────────
-    map_frame = tk.Frame(outer, bg=_C["input"], height=320)
+    # per client feedback, twice ("much more bigger", then "still
+    # needs to be bigger") — now 480 tall, matching the wider dialog.
+    map_frame = tk.Frame(outer, bg=_C["input"], height=480)
     map_frame.pack(fill="x", pady=(4, 10))
     map_frame.pack_propagate(False)
     map_label = tk.Label(map_frame, text="Loading map…", bg=_C["input"],
@@ -850,7 +853,7 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
             try:
                 raw = base64.b64decode(result["image_b64"])
                 img = Image.open(io.BytesIO(raw))
-                img.thumbnail((480, 320), _RESAMPLE_LANCZOS)
+                img.thumbnail((600, 480), _RESAMPLE_LANCZOS)
                 ph = ImageTk.PhotoImage(img)
                 map_label.config(image=ph, text="")
                 map_label.image = ph  # keep a reference — Tkinter drops it otherwise
