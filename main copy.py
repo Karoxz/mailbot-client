@@ -201,7 +201,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-18c"
+BUILD_VERSION          = "2026-09-19a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -826,16 +826,30 @@ def _get_thread_label_names(svc, thread_id: str, label_map: dict) -> list:
 
 def _safe_mark_read(svc, msg_id: str, thread_id: str,
                     label_map: dict, subject: str, log_func=None):
+    """
+    Real bug, reported 2026-09-19: this used to unconditionally call
+    mark_as_unread() on every message in a labeled/protected thread,
+    every time this function ran for it — including when a dispatcher
+    had already opened and read the message themselves in Gmail. Since
+    a message reaching this function isn't necessarily brand new (the
+    in-memory processed_ids dedup is wiped on every app restart, and
+    evicts its own oldest entries past 2000), that meant a genuinely
+    human "I've read this" action could get silently reverted back to
+    unread later, for no new reason — confusing, and it undermines
+    trust in the unread counter. The actual visibility guarantee for a
+    labeled thread doesn't need Gmail's own read state at all — that's
+    already what _notify_labeled_thread's Telegram ping is for. So
+    this now leaves the message's read/unread state alone entirely for
+    labeled threads: a genuinely new message still arrives unread
+    (Gmail's own default, nothing to force), and a message the
+    dispatcher has already read stays read.
+    """
     label_names, thread_subject = _get_thread_info(svc, thread_id, label_map)
     if label_names:
-        try:
-            mark_as_unread(svc, msg_id)
-        except Exception:
-            pass
         _notify_labeled_thread(label_names, thread_subject or subject,
                                thread_id, reverted=True)
         if log_func:
-            log_func(f"🔒 Protected labeled thread [{msg_id[-8:]}] labels={label_names}")
+            log_func(f"🔒 Labeled thread [{msg_id[-8:]}] — left as-is, labels={label_names}")
         return
     mark_as_read(svc, msg_id)
 
@@ -1142,17 +1156,23 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
 
 
 # Per-thread cooldown for reply classification — real bug, reported
-# 2026-09-17: a labeled/protected thread is deliberately kept unread
-# forever by _safe_mark_read() (so the dispatcher keeps seeing it in
-# their inbox), which means every automated message that lands in that
-# same thread (load-board reminders/reposts — not a real new broker
-# reply) gets fetched again on every poll and independently spawns its
-# own _run_classify_and_notify call. With no dedup here, a single
+# 2026-09-17: a labeled/protected thread stayed unread in Gmail until a
+# dispatcher actually opened it (at the time, _safe_mark_read() also
+# forced it back to unread on every pass — see that function's own
+# 2026-09-19 fix for why that part changed), so every automated
+# message landing in that same thread in the meantime (load-board
+# reminders/reposts — not a real new broker reply) got fetched again
+# on every poll and independently spawned its own
+# _run_classify_and_notify call. With no dedup here, a single
 # underlying event got reclassified and re-notified roughly once per
 # poll cycle, reported as "the same notification ~100 times... even
 # though the broker didn't reply." Same 5-minute cooldown window and
 # lock pattern as _notify_labeled_thread's, applied per thread_id
-# before ever calling the server (also saves the wasted LLM calls).
+# before ever calling the server (also saves the wasted LLM calls) —
+# still valuable defense-in-depth even now that _safe_mark_read no
+# longer force-reverts a dispatcher's own read action, since an
+# unread message reaching a fresh app restart can still be
+# rediscovered and reprocessed.
 _CLASSIFY_NOTIFY_COOLDOWN_SEC = 300  # 5 minutes
 _last_classify_attempt: dict = {}    # {thread_id: last-attempt unix time}
 _classify_attempt_lock = threading.Lock()
