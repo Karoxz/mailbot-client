@@ -48,7 +48,8 @@ def call_build_bid(license_key, machine_id, load_data) -> Optional[str]:
         print(f"call_build_bid error: {e}")
     return None
 
-def call_route_map(license_key, machine_id, pickup_loc, delivery_loc) -> Optional[dict]:
+def call_route_map(license_key, machine_id, pickup_loc, delivery_loc,
+                    frame_w=None, frame_h=None) -> Optional[dict]:
     """
     BID PC price-entry dialog (2026-09-19) — fetches a route map image
     (base64 PNG) for the pickup->delivery pair. Returns the server's
@@ -56,12 +57,25 @@ def call_route_map(license_key, machine_id, pickup_loc, delivery_loc) -> Optiona
     transport-level failure (timeout, connection error) — the dialog
     treats both None and success=False the same way: skip the map,
     show route info as text instead.
+
+    frame_w/frame_h (2026-09-19, real fix after two rounds of client
+    feedback on the same map) — the actual pixel size of the client's
+    display area, so the server can request an image whose ASPECT
+    RATIO already matches it. Without this, a fixed-aspect image
+    either left grey letterbox bars (fit-to-frame) or had to be
+    cropped to fill the frame (which was cropping the pickup/delivery
+    markers off-screen on routes whose orientation didn't match the
+    frame). Optional — omit for the old fixed-aspect behavior.
     """
     try:
+        payload = {"license_key": license_key, "machine_id": machine_id,
+                   "pickup_loc": pickup_loc, "delivery_loc": delivery_loc}
+        if frame_w and frame_h:
+            payload["frame_w"] = frame_w
+            payload["frame_h"] = frame_h
         r = _session.post(
             f"{SERVER_URL}/api/route_map",
-            json={"license_key": license_key, "machine_id": machine_id,
-                  "pickup_loc": pickup_loc, "delivery_loc": delivery_loc},
+            json=payload,
             timeout=12,
         )
         if r.status_code == 200:

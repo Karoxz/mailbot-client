@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19g"
+BUILD_VERSION          = "2026-09-19h"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -869,7 +869,7 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
                          fg=_C["text3"], font=("Segoe UI", 10))
     map_label.pack(fill="both", expand=True)
 
-    _map_state = {"original": None, "resize_job": None}
+    _map_state = {"original": None, "resize_job": None, "fetch_started": False}
 
     def _render_map_at_current_size():
         img = _map_state["original"]
@@ -879,30 +879,32 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         fh = map_frame.winfo_height()
         if fw < 10 or fh < 10:
             return  # frame not laid out yet — the initial <Configure> will retry
+        # "Contain" (fit fully within, no cropping) — real bug,
+        # reported 2026-09-19 right after a same-day "cover" attempt
+        # (scale-to-fill-and-crop) that removed the grey letterbox
+        # bars but started cropping the pickup/delivery markers off a
+        # north-south route in a wide frame: "i cant see the full
+        # map". The actual fix for the grey bars is requesting an
+        # image from the server whose ASPECT RATIO already matches
+        # this frame (see _start_map_fetch below) — once that's true,
+        # thumbnail() fills the frame with zero cropping AND zero
+        # letterboxing at once. This still uses thumbnail() (not the
+        # cover crop) for the rare case the aspect doesn't match
+        # exactly (e.g. after a live resize away from the frame size
+        # the image was originally fetched for) — showing a thin
+        # letterbox bar is a much smaller cost than ever hiding either
+        # marker.
         resized = img.copy()
         resized.thumbnail((fw, fh), _RESAMPLE_LANCZOS)
         ph = ImageTk.PhotoImage(resized)
         map_label.config(image=ph, text="")
         map_label.image = ph  # keep a reference — Tkinter drops it otherwise
 
-    def _on_map_frame_configure(_event):
-        # Debounced — <Configure> fires continuously while the user
-        # drags a resize handle; re-thumbnailing on every single event
-        # would be wasteful and can lag the drag itself.
-        job = _map_state["resize_job"]
-        if job is not None:
-            try:
-                map_frame.after_cancel(job)
-            except Exception:
-                pass
-        _map_state["resize_job"] = map_frame.after(80, _render_map_at_current_size)
-
-    map_frame.bind("<Configure>", _on_map_frame_configure)
-
-    def _load_map():
+    def _load_map(frame_w, frame_h):
         if not pickup or not delivery:
             return
-        result = call_route_map(ACTIVE_LICENSE_KEY, _get_machine_id(), pickup, delivery)
+        result = call_route_map(ACTIVE_LICENSE_KEY, _get_machine_id(), pickup, delivery,
+                                frame_w=frame_w, frame_h=frame_h)
 
         def _apply():
             if not map_label.winfo_exists():
@@ -920,7 +922,42 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
 
         _APP_ROOT.after(0, _apply)
 
-    threading.Thread(target=_load_map, daemon=True).start()
+    def _start_map_fetch_if_ready():
+        # Real bug, reported 2026-09-19 right after adding this: an
+        # EARLIER version tried to read map_frame's size via a single
+        # win.update_idletasks() call made right after packing it,
+        # before the window was ever shown — confirmed by direct
+        # testing that pack geometry for a Toplevel's children isn't
+        # actually computed yet at that point (winfo_width()/height()
+        # both came back 1x1), so the server always fell back to its
+        # default square aspect and the grey bars came right back.
+        # <Configure> only fires with the REAL computed size once the
+        # window is actually mapped/shown (later in this function), so
+        # waiting for that — instead of trying to force it early — is
+        # what actually gives the server accurate dimensions to match.
+        if _map_state["fetch_started"]:
+            return
+        fw = map_frame.winfo_width()
+        fh = map_frame.winfo_height()
+        if fw < 10 or fh < 10:
+            return  # still not really laid out yet — a later <Configure> will retry
+        _map_state["fetch_started"] = True
+        threading.Thread(target=_load_map, args=(fw, fh), daemon=True).start()
+
+    def _on_map_frame_configure(_event):
+        _start_map_fetch_if_ready()
+        # Debounced — <Configure> fires continuously while the user
+        # drags a resize handle; re-thumbnailing on every single event
+        # would be wasteful and can lag the drag itself.
+        job = _map_state["resize_job"]
+        if job is not None:
+            try:
+                map_frame.after_cancel(job)
+            except Exception:
+                pass
+        _map_state["resize_job"] = map_frame.after(80, _render_map_at_current_size)
+
+    map_frame.bind("<Configure>", _on_map_frame_configure)
 
     # ── Price entry + live rate/mile ────────────────────────────────
     tk.Label(outer, text="Total Price", bg=_C["bg"], fg=_C["text2"],
