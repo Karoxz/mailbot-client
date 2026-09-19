@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19e"
+BUILD_VERSION          = "2026-09-19f"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -788,17 +788,21 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         win.configure(bg=_C["bg"])
         win.resizable(True, True)
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        # Widened + the map area enlarged (2026-09-19, client feedback,
-        # twice: "much more bigger", then "still needs to be bigger"
-        # after the first bump) — 420x170 -> 520x320 -> 640x480 for the
-        # map itself. Going meaningfully bigger this round rather than
-        # another small increment.
-        w = 640
-        h = min(920, sh - 100)
+        # Sized as a fraction of the screen (same pattern the main
+        # window itself already uses), not a fixed pixel size —
+        # 2026-09-19, third round of client feedback on this dialog's
+        # size ("5x larger", "make it responsive") after two earlier
+        # fixed-pixel bumps: a constant can only ever be "big enough"
+        # for one particular screen. This scales with the display, and
+        # the map itself now resizes live with the window (see the
+        # <Configure> binding below) instead of staying a fixed image
+        # size while empty space grows around it.
+        w = min(1400, max(700, int(sw * 0.68)))
+        h = min(1000, max(760, int(sh * 0.82)))
         x = (sw - w) // 2
         y = max(20, (sh - h) // 2 - 20)
         win.geometry(f"{w}x{h}+{x}+{y}")
-        win.minsize(480, 600)
+        win.minsize(560, 640)
         win.transient(_APP_ROOT)
     except Exception as e:
         print(f"[BID-DIALOG] failed to open: {e}")
@@ -829,15 +833,48 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
                  font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 8))
 
     # ── Route map — fetched in the background, dialog opens instantly
-    # rather than blocking on a network round trip. Enlarged 2026-09-19
-    # per client feedback, twice ("much more bigger", then "still
-    # needs to be bigger") — now 480 tall, matching the wider dialog.
-    map_frame = tk.Frame(outer, bg=_C["input"], height=480)
-    map_frame.pack(fill="x", pady=(4, 10))
-    map_frame.pack_propagate(False)
+    # rather than blocking on a network round trip. Made responsive
+    # 2026-09-19 (client feedback, third round on this dialog's size —
+    # "5x larger", "make it responsive" — after two earlier fixed-
+    # pixel bumps): fill/expand instead of a fixed height, and the
+    # ORIGINAL full-resolution image is kept in memory so it can be
+    # re-thumbnailed to whatever size the frame actually is every time
+    # the window resizes, rather than staying one fixed size forever.
+    map_frame = tk.Frame(outer, bg=_C["input"])
+    map_frame.pack(fill="both", expand=True, pady=(4, 10))
     map_label = tk.Label(map_frame, text="Loading map…", bg=_C["input"],
                          fg=_C["text3"], font=("Segoe UI", 10))
-    map_label.pack(expand=True)
+    map_label.pack(fill="both", expand=True)
+
+    _map_state = {"original": None, "resize_job": None}
+
+    def _render_map_at_current_size():
+        img = _map_state["original"]
+        if img is None or not map_label.winfo_exists():
+            return
+        fw = map_frame.winfo_width()
+        fh = map_frame.winfo_height()
+        if fw < 10 or fh < 10:
+            return  # frame not laid out yet — the initial <Configure> will retry
+        resized = img.copy()
+        resized.thumbnail((fw, fh), _RESAMPLE_LANCZOS)
+        ph = ImageTk.PhotoImage(resized)
+        map_label.config(image=ph, text="")
+        map_label.image = ph  # keep a reference — Tkinter drops it otherwise
+
+    def _on_map_frame_configure(_event):
+        # Debounced — <Configure> fires continuously while the user
+        # drags a resize handle; re-thumbnailing on every single event
+        # would be wasteful and can lag the drag itself.
+        job = _map_state["resize_job"]
+        if job is not None:
+            try:
+                map_frame.after_cancel(job)
+            except Exception:
+                pass
+        _map_state["resize_job"] = map_frame.after(80, _render_map_at_current_size)
+
+    map_frame.bind("<Configure>", _on_map_frame_configure)
 
     def _load_map():
         if not pickup or not delivery:
@@ -852,11 +889,8 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
                 return
             try:
                 raw = base64.b64decode(result["image_b64"])
-                img = Image.open(io.BytesIO(raw))
-                img.thumbnail((600, 480), _RESAMPLE_LANCZOS)
-                ph = ImageTk.PhotoImage(img)
-                map_label.config(image=ph, text="")
-                map_label.image = ph  # keep a reference — Tkinter drops it otherwise
+                _map_state["original"] = Image.open(io.BytesIO(raw))
+                _render_map_at_current_size()
             except Exception as e:
                 print(f"[BID-MAP] decode failed: {e}")
                 map_label.config(text="Map unavailable")
@@ -916,14 +950,13 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         rate = (p / total_miles) if total_miles else None
         on_confirm(p, rate)
 
+    # Cancel button removed per client request (2026-09-19) — the
+    # window's own title-bar close (X) still dismisses the dialog
+    # without confirming a price, same as Cancel did.
     tk.Button(btn_row, text="💵  Make Offer", command=_confirm,
               bg=_C["accent"], fg="#ffffff", activebackground=_C["accent"],
               activeforeground="#ffffff", font=("Segoe UI", 11, "bold"),
               relief="flat", padx=16, pady=9, cursor="hand2").pack(fill="x")
-    tk.Button(btn_row, text="Cancel", command=win.destroy,
-              bg=_C["input"], fg=_C["text2"], activebackground=_C["border"],
-              activeforeground=_C["text"], font=("Segoe UI", 10), relief="flat",
-              padx=12, pady=6, cursor="hand2").pack(fill="x", pady=(6, 0))
 
     try:
         win.deiconify()
