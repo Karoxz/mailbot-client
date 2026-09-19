@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19h"
+BUILD_VERSION          = "2026-09-19i"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -818,19 +818,23 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     rec          = load.get("bid_recommendation") or {}
     default_price = rec.get("suggested_amount")
 
+    # Enlarged + switched to the bright/white text token — client
+    # feedback, 2026-09-19: "info at the top should be a little
+    # bigger, clear white font so its easily visible and readable".
+    # Was text2/text3 (dimmer secondary/tertiary tones) at 10pt/9pt.
     tk.Label(outer, text=f"🚛  Order #{order_id}", bg=_C["bg"], fg=_C["text"],
-             font=("Segoe UI", 12, "bold")).pack(anchor="w")
+             font=("Segoe UI", 13, "bold")).pack(anchor="w")
     tk.Label(outer, text=f"{pickup}  →  {delivery}" if (pickup or delivery) else "Route unknown",
-             bg=_C["bg"], fg=_C["text2"], font=("Segoe UI", 10),
-             wraplength=380, justify="left").pack(anchor="w", pady=(2, 0))
+             bg=_C["bg"], fg=_C["text"], font=("Segoe UI", 12),
+             wraplength=380, justify="left").pack(anchor="w", pady=(3, 0))
     miles_bits = []
     if total_miles:
         miles_bits.append(f"{total_miles} mi total")
     if deadhead is not None:
         miles_bits.append(f"{deadhead} mi deadhead")
     if miles_bits:
-        tk.Label(outer, text="  ·  ".join(miles_bits), bg=_C["bg"], fg=_C["text3"],
-                 font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 8))
+        tk.Label(outer, text="  ·  ".join(miles_bits), bg=_C["bg"], fg=_C["text"],
+                 font=("Segoe UI", 11)).pack(anchor="w", pady=(0, 8))
 
     # Button row created (and packed) HERE, BEFORE the expanding map
     # frame below — real bug, reported 2026-09-19: "map covers
@@ -1010,7 +1014,7 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     # Cancel button removed per client request (2026-09-19) — the
     # window's own title-bar close (X) still dismisses the dialog
     # without confirming a price, same as Cancel did.
-    tk.Button(btn_row, text="💵  Make Offer", command=_confirm,
+    tk.Button(btn_row, text="💵  Make a Bid", command=_confirm,
               bg=_C["accent"], fg="#ffffff", activebackground=_C["accent"],
               activeforeground="#ffffff", font=("Segoe UI", 11, "bold"),
               relief="flat", padx=16, pady=9, cursor="hand2").pack(fill="x")
