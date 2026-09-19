@@ -8,7 +8,8 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from api_client import (call_parse, call_build_bid, call_poll_push,
                          call_set_thread_learning, call_get_thread_learning_status,
                          call_backfill_thread,
-                         call_get_telegram_status, call_set_telegram_enabled)
+                         call_get_telegram_status, call_set_telegram_enabled,
+                         call_route_map)
 
 import sys
 import io
@@ -201,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19a"
+BUILD_VERSION          = "2026-09-19b"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -260,6 +261,11 @@ ETA to PU: {deadhead_eta_str}
 ALL BIDS ARE VALID 15 MIN"""
 
 ACTIVE_LICENSE_KEY = None
+
+# BID PC price-entry dialog (2026-09-19) needs the Tk root from
+# handle_bid_callbacks' background thread — see the assignment next to
+# `root = tk.Tk()` for why this can't just be a closure variable.
+_APP_ROOT = None
 
 _URL_STORE: dict = {}
 _URL_STORE_LOCK  = threading.Lock()
@@ -720,6 +726,171 @@ def _open_bid_thread(order_id: str, load: dict):
     _flog("warning", msg)
     webbrowser.open(f"https://mail.google.com/mail/u/0/#search/{quote(str(order_id))}")
 
+
+def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_confirm):
+    """
+    New feature, 2026-09-19 (client request, modeled on a load-board
+    mini-app screenshot): pressing BID PC used to go straight from
+    "copy the templated bid text" to "open the Gmail thread" with no
+    price ever actually decided or communicated to the broker — the
+    template has no price line at all, the dispatcher was expected to
+    add one by hand after pasting. This dialog shows the route (as a
+    real map image, fetched server-side via /api/route_map so the
+    Google Maps API key never reaches the client — same pattern as
+    every other server-held secret in this project) alongside a price
+    field with a live rate/mile readout, defaulted to the existing
+    bid_recommendation suggestion when one exists. Only once a price
+    is confirmed does the usual BID PC flow (copy to clipboard, open
+    the thread, record the bid) actually run — via `on_confirm(price,
+    rate_per_mile)`, called by the caller (handle_bid_callbacks) with
+    the exact same logic that ran unconditionally before, just now
+    carrying a real price into the draft text.
+
+    Runs on the Tk main thread — handle_bid_callbacks (the caller)
+    lives on the background Telegram-polling thread and must schedule
+    this via `_APP_ROOT.after(0, ...)`, never call it directly.
+    """
+    if _APP_ROOT is None:
+        return
+
+    win = tk.Toplevel(_APP_ROOT)
+    win.title(f"Bid — Order #{order_id}")
+    win.configure(bg=_C["bg"])
+    win.resizable(True, True)
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w = 420
+    h = min(640, sh - 100)
+    x = (sw - w) // 2
+    y = max(20, (sh - h) // 2 - 20)
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    win.minsize(360, 420)
+    win.transient(_APP_ROOT)
+
+    outer = tk.Frame(win, bg=_C["bg"])
+    outer.pack(fill="both", expand=True, padx=16, pady=14)
+
+    pickup       = load.get("pickup_loc", "") or ""
+    delivery     = load.get("delivery_loc", "") or ""
+    total_miles  = load.get("total_miles")
+    deadhead     = (truck or {}).get("google_deadhead") or load.get("google_deadhead")
+    rec          = load.get("bid_recommendation") or {}
+    default_price = rec.get("suggested_amount")
+
+    tk.Label(outer, text=f"🚛  Order #{order_id}", bg=_C["bg"], fg=_C["text"],
+             font=("Segoe UI", 12, "bold")).pack(anchor="w")
+    tk.Label(outer, text=f"{pickup}  →  {delivery}" if (pickup or delivery) else "Route unknown",
+             bg=_C["bg"], fg=_C["text2"], font=("Segoe UI", 10),
+             wraplength=380, justify="left").pack(anchor="w", pady=(2, 0))
+    miles_bits = []
+    if total_miles:
+        miles_bits.append(f"{total_miles} mi total")
+    if deadhead is not None:
+        miles_bits.append(f"{deadhead} mi deadhead")
+    if miles_bits:
+        tk.Label(outer, text="  ·  ".join(miles_bits), bg=_C["bg"], fg=_C["text3"],
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 8))
+
+    # ── Route map — fetched in the background, dialog opens instantly
+    # rather than blocking on a network round trip ─────────────────────
+    map_frame = tk.Frame(outer, bg=_C["input"], height=170)
+    map_frame.pack(fill="x", pady=(4, 10))
+    map_frame.pack_propagate(False)
+    map_label = tk.Label(map_frame, text="Loading map…", bg=_C["input"],
+                         fg=_C["text3"], font=("Segoe UI", 10))
+    map_label.pack(expand=True)
+
+    def _load_map():
+        if not pickup or not delivery:
+            return
+        result = call_route_map(ACTIVE_LICENSE_KEY, _get_machine_id(), pickup, delivery)
+
+        def _apply():
+            if not map_label.winfo_exists():
+                return  # dialog closed before the fetch finished
+            if not result or not result.get("success"):
+                map_label.config(text="Map unavailable")
+                return
+            try:
+                raw = base64.b64decode(result["image_b64"])
+                img = Image.open(io.BytesIO(raw))
+                img.thumbnail((380, 170), _RESAMPLE_LANCZOS)
+                ph = ImageTk.PhotoImage(img)
+                map_label.config(image=ph, text="")
+                map_label.image = ph  # keep a reference — Tkinter drops it otherwise
+            except Exception as e:
+                print(f"[BID-MAP] decode failed: {e}")
+                map_label.config(text="Map unavailable")
+
+        _APP_ROOT.after(0, _apply)
+
+    threading.Thread(target=_load_map, daemon=True).start()
+
+    # ── Price entry + live rate/mile ────────────────────────────────
+    tk.Label(outer, text="Total Price", bg=_C["bg"], fg=_C["text2"],
+             font=("Segoe UI", 10)).pack(anchor="w")
+    price_e = tk.Entry(outer, bg=_C["input"], fg=_C["text"],
+                       insertbackground=_C["text"], relief="flat",
+                       font=("Segoe UI", 16, "bold"), highlightthickness=1,
+                       highlightbackground=_C["border"], highlightcolor=_C["accent"])
+    if default_price:
+        price_e.insert(0, f"{default_price:.0f}")
+    price_e.pack(fill="x", ipady=6, pady=(2, 10))
+
+    tk.Label(outer, text="Rate Per Mile", bg=_C["bg"], fg=_C["text2"],
+             font=("Segoe UI", 10)).pack(anchor="w")
+    rate_var = tk.StringVar(value="—")
+    tk.Label(outer, textvariable=rate_var, bg=_C["bg"], fg=_C["accent"],
+             font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(2, 8))
+
+    def _recalc(*_):
+        raw = price_e.get().strip().replace(",", "").replace("$", "")
+        if not raw:
+            rate_var.set("—")
+            return
+        try:
+            p = float(raw)
+        except ValueError:
+            rate_var.set("—")
+            return
+        rate_var.set(f"${p / total_miles:.2f}/mi" if total_miles else "— (miles unknown)")
+
+    price_e.bind("<KeyRelease>", _recalc)
+    _recalc()
+
+    err_lbl = tk.Label(outer, text="", bg=_C["bg"], fg=_C["red"], font=("Segoe UI", 9))
+    err_lbl.pack(anchor="w")
+
+    btn_row = tk.Frame(outer, bg=_C["bg"])
+    btn_row.pack(fill="x", side="bottom", pady=(10, 0))
+
+    def _confirm():
+        raw = price_e.get().strip().replace(",", "").replace("$", "")
+        try:
+            p = float(raw)
+            if p <= 0:
+                raise ValueError
+        except ValueError:
+            err_lbl.config(text="Enter a valid price first.")
+            return
+        win.destroy()
+        rate = (p / total_miles) if total_miles else None
+        on_confirm(p, rate)
+
+    tk.Button(btn_row, text="💵  Make Offer", command=_confirm,
+              bg=_C["accent"], fg="#ffffff", activebackground=_C["accent"],
+              activeforeground="#ffffff", font=("Segoe UI", 11, "bold"),
+              relief="flat", padx=16, pady=9, cursor="hand2").pack(fill="x")
+    tk.Button(btn_row, text="Cancel", command=win.destroy,
+              bg=_C["input"], fg=_C["text2"], activebackground=_C["border"],
+              activeforeground=_C["text"], font=("Segoe UI", 10), relief="flat",
+              padx=12, pady=6, cursor="hand2").pack(fill="x", pady=(6, 0))
+
+    win.grab_set()
+    win.focus_set()
+    price_e.focus_set()
+    price_e.icursor("end")
+
+
 def mark_as_read(service, msg_id):
     try:
         service.users().messages().modify(
@@ -1094,22 +1265,30 @@ def create_reply_draft(service, original_msg_full, body_text,
 # BID BODY — calls server to render template
 # =============================================================
 
-def _build_bid_body_for_order(order_id):
+def _build_bid_body_for_order(order_id, price=None, rate_per_mile=None):
     with LOAD_STORE_LOCK:
         load = LOAD_STORE.get(order_id)
     if not load:
         return None
+    load_data = {k: v for k, v in load.items() if k != "original_msg_full"}
+    # BID PC price-entry dialog (2026-09-19) — a confirmed price from
+    # the dispatcher, threaded through to build_bid_email_body server-
+    # side so it actually reaches the broker in the draft/reply text.
+    if price is not None:
+        load_data["price"] = price
+        load_data["rate_per_mile"] = rate_per_mile
     return call_build_bid(
         license_key=ACTIVE_LICENSE_KEY,
         machine_id=_get_machine_id(),
-        load_data={k: v for k, v in load.items() if k != "original_msg_full"},
+        load_data=load_data,
     )
 
 # =============================================================
 # BID HISTORY — fire-and-forget write on every bid-send action
 # =============================================================
 
-def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Optional[int]:
+def _record_bid(load: dict, method: str, truck: Optional[dict] = None,
+                bid_amount: Optional[float] = None) -> Optional[int]:
     """
     Called right after a bid is actually copied/sent/drafted (BID PC,
     BID PHONE, or DRAFT). `truck` is the selected all_trucks entry when
@@ -1121,10 +1300,12 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
     this always runs after the real send/copy/draft has already
     happened, and any error here is swallowed and logged only.
 
-    Returns the new bid_id (or None on failure). bid_amount starts out
-    unset — it's filled in automatically afterward by the periodic
-    thread-learning backfill (reads it straight from the dispatcher's
-    own reply in the "bid"-labeled Gmail thread), not typed in here.
+    Returns the new bid_id (or None on failure). bid_amount used to
+    always start out unset, filled in later by the periodic thread-
+    learning backfill (reads it from the dispatcher's own reply in the
+    "bid"-labeled thread) — the 2026-09-19 BID PC price-entry dialog
+    now gives us the real number immediately at click time for that
+    path, so pass it straight through when known instead of waiting.
     """
     driver = truck if truck else load
     try:
@@ -1146,6 +1327,7 @@ def _record_bid(load: dict, method: str, truck: Optional[dict] = None) -> Option
                 "total_miles":     load.get("total_miles"),
                 "verified_miles":  (load.get("maps_verification") or {}).get("verified_miles"),
                 "verified_source": (load.get("maps_verification") or {}).get("verified_source"),
+                "bid_amount":      bid_amount,
             },
         )
         return result.get("bid_id") if result else None
@@ -1384,39 +1566,70 @@ def handle_bid_callbacks(service):
             all_trucks = load.get("all_trucks", [])
             print(f"[DEBUG] Order {order_id}: all_trucks={len(all_trucks)} -> {[t.get('driver_name') for t in all_trucks]}")
             if len(parts) > 2:
-                # Driver already selected — perform the bid
+                # Driver already selected — show the price dialog, THEN bid
                 truck_idx = int(parts[2])
                 if truck_idx >= len(all_trucks):
                     continue
                 selected = all_trucks[truck_idx]
-                body = _build_bid_body_for_load(load, selected)
-                if not body:
-                    continue
-                try:
-                    pyperclip.copy(body)
-                    _open_bid_thread(order_id, load)
-                    _bid_id = _record_bid(load, "pc", selected)
-                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
-                    # now fills in automatically via thread learning instead)
-                    send_to_telegram(
-                        f"📋 Bid for {selected['driver_name']} copied. Press Reply and paste (Ctrl+V).")
-                except Exception as e:
-                    print("Bid callback failed:", e)
+
+                def _do_pc_bid_multi(price, rate, load=load, order_id=order_id,
+                                     selected=selected):
+                    body = _build_bid_body_for_load(load, selected, price, rate)
+                    if not body:
+                        return
+                    try:
+                        pyperclip.copy(body)
+                        _open_bid_thread(order_id, load)
+                        _bid_id = _record_bid(load, "pc", selected, bid_amount=price)
+                        send_to_telegram(
+                            f"📋 Bid for {selected['driver_name']} copied — "
+                            f"${price:,.0f} (${rate:.2f}/mi). Press Reply and paste (Ctrl+V)."
+                            if rate else
+                            f"📋 Bid for {selected['driver_name']} copied — "
+                            f"${price:,.0f}. Press Reply and paste (Ctrl+V).")
+                    except Exception as e:
+                        print("Bid callback failed:", e)
+
+                if _APP_ROOT is not None:
+                    # Default-arg capture, not a bare closure — real bug
+                    # avoided here: handle_bid_callbacks can schedule
+                    # several of these in one poll batch (two BID PC
+                    # taps arriving together) before the Tk main thread
+                    # gets around to running any of them, and by then
+                    # this loop has already moved on to the NEXT cq's
+                    # order_id/load/selected. A bare lambda would look
+                    # those names up at call time and get the wrong
+                    # order's data; freezing them as defaults snapshots
+                    # the values at schedule time instead.
+                    _APP_ROOT.after(
+                        0, lambda order_id=order_id, load=load, selected=selected,
+                                  cb=_do_pc_bid_multi:
+                            _open_bid_price_dialog(order_id, load, selected, cb))
 
             elif not all_trucks or len(all_trucks) == 1:
-                # Only one driver — proceed directly
-                body = _build_bid_body_for_order(order_id)
-                if not body:
-                    continue
-                try:
-                    pyperclip.copy(body)
-                    _open_bid_thread(order_id, load)
-                    _bid_id = _record_bid(load, "pc")
-                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
-                    # now fills in automatically via thread learning instead)
-                    send_to_telegram("📋 Bid text copied. Press Reply and paste (Ctrl+V).")
-                except Exception as e:
-                    print("Bid callback failed:", e)
+                # Only one driver — show the price dialog, THEN proceed
+                def _do_pc_bid_single(price, rate, load=load, order_id=order_id):
+                    body = _build_bid_body_for_order(order_id, price, rate)
+                    if not body:
+                        return
+                    try:
+                        pyperclip.copy(body)
+                        _open_bid_thread(order_id, load)
+                        _bid_id = _record_bid(load, "pc", bid_amount=price)
+                        send_to_telegram(
+                            f"📋 Bid text copied — ${price:,.0f} (${rate:.2f}/mi). "
+                            f"Press Reply and paste (Ctrl+V)."
+                            if rate else
+                            f"📋 Bid text copied — ${price:,.0f}. Press Reply and paste (Ctrl+V).")
+                    except Exception as e:
+                        print("Bid callback failed:", e)
+
+                if _APP_ROOT is not None:
+                    # Same late-binding fix as the branch above.
+                    _APP_ROOT.after(
+                        0, lambda order_id=order_id, load=load,
+                                  cb=_do_pc_bid_single:
+                            _open_bid_price_dialog(order_id, load, None, cb))
 
             else:
                 # Multiple drivers — show selection
@@ -1596,26 +1809,32 @@ def handle_bid_callbacks(service):
                 print("Reply callback failed:", e)
 
 
-def _build_bid_body_for_load(load: dict, truck: dict) -> Optional[str]:
+def _build_bid_body_for_load(load: dict, truck: dict,
+                             price=None, rate_per_mile=None) -> Optional[str]:
     """Build bid body using a specific truck from all_trucks list."""
+    load_data = {
+        "order":                load.get("order"),
+        "vehicle_required":     load.get("vehicle_required"),
+        "pickup_loc":           load.get("pickup_loc"),
+        "pickup_dt":            load.get("pickup_dt"),
+        "delivery_loc":         load.get("delivery_loc"),
+        "delivery_dt":          load.get("delivery_dt"),
+        "google_deadhead":      truck.get("google_deadhead"),
+        "deadhead_eta_minutes": truck.get("deadhead_eta_minutes"),
+        "driver_name":          truck.get("driver_name"),
+        "truck_type":           truck.get("truck_type"),
+        "truck_dimensions":     truck.get("truck_dimensions"),
+        "truck_equipment":      truck.get("truck_equipment", ""),
+        "bid_template":         load.get("bid_template"),
+    }
+    # BID PC price-entry dialog (2026-09-19) — see _build_bid_body_for_order.
+    if price is not None:
+        load_data["price"] = price
+        load_data["rate_per_mile"] = rate_per_mile
     return call_build_bid(
         license_key=ACTIVE_LICENSE_KEY,
         machine_id=_get_machine_id(),
-        load_data={
-            "order":                load.get("order"),
-            "vehicle_required":     load.get("vehicle_required"),
-            "pickup_loc":           load.get("pickup_loc"),
-            "pickup_dt":            load.get("pickup_dt"),
-            "delivery_loc":         load.get("delivery_loc"),
-            "delivery_dt":          load.get("delivery_dt"),
-            "google_deadhead":      truck.get("google_deadhead"),
-            "deadhead_eta_minutes": truck.get("deadhead_eta_minutes"),
-            "driver_name":          truck.get("driver_name"),
-            "truck_type":           truck.get("truck_type"),
-            "truck_dimensions":     truck.get("truck_dimensions"),
-            "truck_equipment":      truck.get("truck_equipment", ""),
-            "bid_template":         load.get("bid_template"),
-        }
+        load_data=load_data,
     )
 
 # =============================================================
@@ -2420,6 +2639,14 @@ def create_app():
     root.minsize(800, 700)
     root.resizable(True, True)
 
+    # BID PC price-entry dialog (2026-09-19) is opened from the
+    # background Telegram-callback thread (handle_bid_callbacks), which
+    # has no access to this closure's `root` — module-level handle so
+    # that top-level code can marshal dialog creation onto the Tk main
+    # thread via root.after(...).
+    global _APP_ROOT
+    _APP_ROOT = root
+
     def _center_window(r):
         sw = r.winfo_screenwidth()
         sh = r.winfo_screenheight()
@@ -2998,6 +3225,11 @@ def create_app():
             ("{order}",              "Order number"),
             ("{broker_name}",        "Broker name"),
             ("{vehicle_required}",   "Vehicle required from email"),
+            ("{price}",              "Confirmed price from the BID PC dialog, "
+                                      "e.g. $1,234 — blank if BID PC wasn't used "
+                                      "(auto-appended if you don't place it yourself)"),
+            ("{rate_per_mile}",      "Rate per mile from the BID PC dialog, "
+                                      "e.g. $1.79/mi"),
         ]:
             r = tk.Frame(ref_inner, bg=_C["input"])
             r.pack(fill="x", pady=1, padx=10)

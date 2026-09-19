@@ -47,6 +47,28 @@ def call_build_bid(license_key, machine_id, load_data) -> Optional[str]:
     except Exception as e:
         print(f"call_build_bid error: {e}")
     return None
+
+def call_route_map(license_key, machine_id, pickup_loc, delivery_loc) -> Optional[dict]:
+    """
+    BID PC price-entry dialog (2026-09-19) — fetches a route map image
+    (base64 PNG) for the pickup->delivery pair. Returns the server's
+    {"success": bool, "image_b64"/"reason": ...} dict, or None on a
+    transport-level failure (timeout, connection error) — the dialog
+    treats both None and success=False the same way: skip the map,
+    show route info as text instead.
+    """
+    try:
+        r = _session.post(
+            f"{SERVER_URL}/api/route_map",
+            json={"license_key": license_key, "machine_id": machine_id,
+                  "pickup_loc": pickup_loc, "delivery_loc": delivery_loc},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"call_route_map error: {e}")
+    return None
 def call_poll_push(license_key, machine_id):
     try:
         r = requests.get(
