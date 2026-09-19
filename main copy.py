@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19f"
+BUILD_VERSION          = "2026-09-19g"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -832,6 +832,17 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         tk.Label(outer, text="  ·  ".join(miles_bits), bg=_C["bg"], fg=_C["text3"],
                  font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 8))
 
+    # Button row created (and packed) HERE, BEFORE the expanding map
+    # frame below — real bug, reported 2026-09-19: "map covers
+    # everything the button is not visible anymore". Same fix as
+    # _open_truck_dialog's own button row: a side="bottom" widget must
+    # be packed before an expand=True sibling so it reserves its space
+    # first, or the expanding sibling claims the whole cavity and the
+    # button (packed after it) never gets room. The actual button
+    # widget is added into this frame later, once _confirm exists.
+    btn_row = tk.Frame(outer, bg=_C["bg"])
+    btn_row.pack(fill="x", side="bottom", pady=(10, 0))
+
     # ── Route map — fetched in the background, dialog opens instantly
     # rather than blocking on a network round trip. Made responsive
     # 2026-09-19 (client feedback, third round on this dialog's size —
@@ -840,8 +851,20 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     # ORIGINAL full-resolution image is kept in memory so it can be
     # re-thumbnailed to whatever size the frame actually is every time
     # the window resizes, rather than staying one fixed size forever.
+    #
+    # pack_propagate(False) matters here — real bug, reported the same
+    # day: "it starts small than enlarges too big". Without it, a
+    # Label showing a real image reports the IMAGE's own pixel size as
+    # its natural size, which (since nothing else constrained
+    # map_frame) let map_frame grow to match the image, which retriggers
+    # <Configure>, which re-thumbnails to the NEW bigger frame size,
+    # which grows the frame again — a runaway feedback loop. With
+    # pack_propagate(False), map_frame's size is dictated ONLY by
+    # outer's own top-down layout (this fill/expand line), never by
+    # what's inside it, so the loop can't start.
     map_frame = tk.Frame(outer, bg=_C["input"])
     map_frame.pack(fill="both", expand=True, pady=(4, 10))
+    map_frame.pack_propagate(False)
     map_label = tk.Label(map_frame, text="Loading map…", bg=_C["input"],
                          fg=_C["text3"], font=("Segoe UI", 10))
     map_label.pack(fill="both", expand=True)
@@ -933,9 +956,6 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
 
     err_lbl = tk.Label(outer, text="", bg=_C["bg"], fg=_C["red"], font=("Segoe UI", 9))
     err_lbl.pack(anchor="w")
-
-    btn_row = tk.Frame(outer, bg=_C["bg"])
-    btn_row.pack(fill="x", side="bottom", pady=(10, 0))
 
     def _confirm():
         raw = price_e.get().strip().replace(",", "").replace("$", "")
