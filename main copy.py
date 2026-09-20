@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-19i"
+BUILD_VERSION          = "2026-09-20a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -824,9 +824,16 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     # Was text2/text3 (dimmer secondary/tertiary tones) at 10pt/9pt.
     tk.Label(outer, text=f"🚛  Order #{order_id}", bg=_C["bg"], fg=_C["text"],
              font=("Segoe UI", 13, "bold")).pack(anchor="w")
+    # No wraplength — real bug, reported 2026-09-20: 380px was sized
+    # for the dialog's original fixed 420px width, and started
+    # wrapping the route onto two lines once the dialog became
+    # screen-relative-sized (client: "i want the states info to be
+    # fit in 1 line"). The dialog is comfortably wide enough for one
+    # line at its current minsize (560px) that this doesn't need a
+    # wrap constraint at all.
     tk.Label(outer, text=f"{pickup}  →  {delivery}" if (pickup or delivery) else "Route unknown",
              bg=_C["bg"], fg=_C["text"], font=("Segoe UI", 12),
-             wraplength=380, justify="left").pack(anchor="w", pady=(3, 0))
+             justify="left").pack(anchor="w", pady=(3, 0))
     miles_bits = []
     if total_miles:
         miles_bits.append(f"{total_miles} mi total")
