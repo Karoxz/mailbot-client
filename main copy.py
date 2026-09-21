@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-20a"
+BUILD_VERSION          = "2026-09-21a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -815,8 +815,6 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     delivery     = load.get("delivery_loc", "") or ""
     total_miles  = load.get("total_miles")
     deadhead     = (truck or {}).get("google_deadhead") or load.get("google_deadhead")
-    rec          = load.get("bid_recommendation") or {}
-    default_price = rec.get("suggested_amount")
 
     # Enlarged + switched to the bright/white text token — client
     # feedback, 2026-09-19: "info at the top should be a little
@@ -973,12 +971,14 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     # ── Price entry + live rate/mile ────────────────────────────────
     tk.Label(outer, text="Total Price", bg=_C["bg"], fg=_C["text2"],
              font=("Segoe UI", 10)).pack(anchor="w")
+    # No pre-filled AI-suggested price — real fix, 2026-09-21 (client
+    # feedback): "there shouldnt be any starting price there before
+    # the client inputs it". Starts blank; the dispatcher always types
+    # their own real number.
     price_e = tk.Entry(outer, bg=_C["input"], fg=_C["text"],
                        insertbackground=_C["text"], relief="flat",
                        font=("Segoe UI", 16, "bold"), highlightthickness=1,
                        highlightbackground=_C["border"], highlightcolor=_C["accent"])
-    if default_price:
-        price_e.insert(0, f"{default_price:.0f}")
     price_e.pack(fill="x", ipady=6, pady=(2, 10))
 
     tk.Label(outer, text="Rate Per Mile", bg=_C["bg"], fg=_C["text2"],
@@ -3387,8 +3387,10 @@ def create_app():
             ("{broker_name}",        "Broker name"),
             ("{vehicle_required}",   "Vehicle required from email"),
             ("{price}",              "Confirmed price from the BID PC dialog, "
-                                      "e.g. $1,234 — blank if BID PC wasn't used "
-                                      "(auto-appended if you don't place it yourself)"),
+                                      "e.g. $1,234 — blank if BID PC wasn't used. "
+                                      "If you don't place this yourself, a blank "
+                                      "\"Rate: $\" line already in the template "
+                                      "gets it filled in automatically instead"),
             ("{rate_per_mile}",      "Rate per mile from the BID PC dialog, "
                                       "e.g. $1.79/mi"),
         ]:
