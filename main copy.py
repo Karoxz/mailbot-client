@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-21a"
+BUILD_VERSION          = "2026-09-23a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -727,6 +727,44 @@ def _open_bid_thread(order_id: str, load: dict):
     webbrowser.open(f"https://mail.google.com/mail/u/0/#search/{quote(str(order_id))}")
 
 
+def _force_window_foreground(win: tk.Toplevel) -> None:
+    """
+    Real bug, reported 2026-09-23: the dispatcher had to click the BID
+    PC dialog before typing — win.focus_force() alone requests Tk-level
+    focus, but Windows' SetForegroundWindow lock still blocks a
+    background-process window from actually receiving OS keyboard
+    input, since BID PC is triggered from a Telegram callback, not
+    from inside the app.
+
+    Uses AttachThreadInput to temporarily share input state with
+    whatever IS currently the foreground thread, which is the
+    documented, non-input-injecting way past that lock. Verified in
+    isolation (3/3 clean runs) against this app's actual call pattern
+    (iconic root, Toplevel opened from a background-thread-scheduled
+    root.after(0, ...)) before use here — the more commonly-suggested
+    "simulate an ALT keypress" trick was tried FIRST and rejected: it
+    reliably froze this app's own Tk event loop instead (2/2
+    reproductions, see _open_bid_price_dialog's docstring). Never
+    raises — foreground-forcing is a nicety, not something that should
+    ever be able to take the dialog down with it.
+    """
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(win.winfo_id())
+        fg_hwnd = user32.GetForegroundWindow()
+        fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+        cur_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_thread and fg_thread != cur_thread:
+            attached = bool(user32.AttachThreadInput(cur_thread, fg_thread, True))
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        if attached:
+            user32.AttachThreadInput(cur_thread, fg_thread, False)
+    except Exception as e:
+        print(f"[BID-DIALOG] force-foreground failed: {e}")
+
+
 def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_confirm):
     """
     New feature, 2026-09-19 (client request, modeled on a load-board
@@ -757,32 +795,36 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     # then I couldn't open the app" -- BID PC is pressed from Telegram,
     # not from inside the desktop app, so the dispatcher's normal
     # workflow has the desktop window minimized/backgrounded at the
-    # exact moment this fires. A `transient()` Toplevel opened on top
-    # of a MINIMIZED parent can end up not actually visible (Windows'
-    # focus-stealing prevention for a window whose owner isn't the
-    # foreground process), while `grab_set()` below still redirects
-    # ALL input to that invisible window -- the whole app reads as
-    # frozen with no visible cause. Restoring/raising the main window
-    # FIRST, and forcing the new dialog to the foreground itself
-    # (temporary topmost + focus_force, not just lift/transient, which
-    # Windows can still ignore for a background-process-owned window)
-    # closes that gap. Wrapped in try/except so a failure here can
-    # never leave a half-built grab stuck on screen.
+    # exact moment this fires. The original fix here restored/raised
+    # the main window first, which worked, but the client later
+    # reported the visible side effect: "when client presses bid pc,
+    # both bid window and app open, only bid window should open".
+    #
+    # Real fix, 2026-09-23 — isolated and verified with a standalone
+    # repro (iconic root + Toplevel created from a background-thread-
+    # scheduled root.after(0, ...), exactly this app's real call
+    # pattern) before touching this function, since this exact area
+    # already caused one freeze incident:
+    #   - `win.transient(_APP_ROOT)` on a STILL-ICONIC root is the
+    #     actual cause of the original invisible-window bug — verified
+    #     directly: with .transient() set, IsWindowVisible()/
+    #     GetForegroundWindow() both come back false/wrong even after
+    #     forcing focus. Dropping .transient() entirely (this dialog
+    #     doesn't need to be OS-owned by the main window — it's a
+    #     fully independent top-level window) fixes that on its own,
+    #     with no need to touch the main window's state at all.
+    #   - The classic "simulate an ALT keypress" trick for bypassing
+    #     Windows' SetForegroundWindow lock was tried and REJECTED —
+    #     verified to reliably freeze this app's own Tk event loop
+    #     (reproduced 2/2 in isolation, single-threaded and threaded
+    #     both) — Tk apparently treats the synthetic ALT key as a
+    #     menu-activation event and never recovers. AttachThreadInput
+    #     (see _force_window_foreground below) achieves the same
+    #     foreground-lock bypass without injecting any synthetic input
+    #     event, and was verified clean (3/3 runs, no hang, dialog
+    #     visible + genuinely foreground + real Tk keyboard focus on
+    #     the price field, main window still untouched/iconic).
     try:
-        if _APP_ROOT.state() == "iconic":
-            _APP_ROOT.deiconify()
-        _APP_ROOT.lift()
-        # update() (not just update_idletasks()) forces Tk to actually
-        # process the deiconify/lift through the window manager before
-        # the Toplevel below is created — real bug found testing this
-        # exact fix: without it, a Toplevel created immediately after
-        # deiconify() could still come back IsWindowVisible()=False,
-        # because Tk's own state had changed but Windows hadn't been
-        # told yet, so the new owned window inherited the stale hidden
-        # state. This is the actual fix for "nothing happened" above,
-        # not just extra caution.
-        _APP_ROOT.update()
-
         win = tk.Toplevel(_APP_ROOT)
         win.title(f"Bid — Order #{order_id}")
         win.configure(bg=_C["bg"])
@@ -803,7 +845,10 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         y = max(20, (sh - h) // 2 - 20)
         win.geometry(f"{w}x{h}+{x}+{y}")
         win.minsize(560, 640)
-        win.transient(_APP_ROOT)
+        # Deliberately NOT win.transient(_APP_ROOT) — see the docstring
+        # note above. This dialog stands on its own; it doesn't need
+        # to be OS-owned by (and inherit the minimized state of) the
+        # main window.
     except Exception as e:
         print(f"[BID-DIALOG] failed to open: {e}")
         return
@@ -1029,15 +1074,10 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
     try:
         win.deiconify()
         win.lift()
-        win.update()  # flush deiconify/lift before the topmost/focus calls below
-        # Temporary topmost is the part that actually beats Windows'
-        # focus-stealing prevention for a window opened by a background
-        # thread's callback — lift()/transient() alone were not enough
-        # (see this function's docstring). Cleared 300ms later so it
-        # doesn't stay pinned above every other window indefinitely.
-        win.attributes("-topmost", True)
-        win.after(300, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
+        win.update()  # flush deiconify/lift before the foreground/focus calls below
+        _force_window_foreground(win)
         win.focus_force()
+        price_e.focus_force()
         win.update()
         # Deliberately NOT grab_set() — real incident, 2026-09-19: a
         # modal grab on a window that (for any reason, anticipated or
@@ -1046,7 +1086,6 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         # indistinguishable from the whole app being frozen. Losing the
         # "can't click the main window while this is open" nicety is a
         # much smaller cost than that failure mode recurring.
-        price_e.focus_set()
         price_e.icursor("end")
     except Exception as e:
         print(f"[BID-DIALOG] failed to focus: {e}")
@@ -2227,8 +2266,26 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
             # STEP 3: thread label guard — one extra API call, only when message is clean.
             # Protects against labeled threads where the trigger message has no custom label yet.
             # Skipped for clear freight emails to save the extra API call.
+            #
+            # Real bug, reported 2026-09-23: a broker's reply (subject
+            # "Re: LARGE STRAIGHT from San Leandro, CA to Phoenix, AZ",
+            # in an already-"bid"/"in route"-labeled thread) got no
+            # Telegram notification at all. Gmail/most mail clients
+            # keep the original subject verbatim on a reply, so
+            # _is_freight matched on "LARGE STRAIGHT" in the subject
+            # even though this was a reply, not a fresh posting — that
+            # sent it to STEP 4 (parse-as-new-load) instead of this
+            # thread-label-guard branch, and STEP 4 correctly found no
+            # fresh load in reply content, so nothing fired at all. A
+            # "Re:"/"Fwd:" prefix means it's essentially never a fresh
+            # posting even if the subject repeats freight terms, so
+            # treat it as not-freight here regardless of FREIGHT_MARKERS
+            # — routes it back through the thread-label-guard branch,
+            # which sends the normal "📌 Label / 📍 States" ping for any
+            # already-labeled thread.
             _thread_id_full = full.get("threadId", "")
-            _is_freight = any(m in _subj_check for m in FREIGHT_MARKERS)
+            _is_reply_subject = _subj_check.strip().startswith(("RE:", "FW:", "FWD:"))
+            _is_freight = (not _is_reply_subject) and any(m in _subj_check for m in FREIGHT_MARKERS)
             if not _is_freight and _thread_id_full:
                 _tl2, _ts2 = _get_thread_info(svc, _thread_id_full, label_map)
                 if _tl2:
