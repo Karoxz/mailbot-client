@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-23a"
+BUILD_VERSION          = "2026-09-23b"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -941,15 +941,26 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         # map". The actual fix for the grey bars is requesting an
         # image from the server whose ASPECT RATIO already matches
         # this frame (see _start_map_fetch below) — once that's true,
-        # thumbnail() fills the frame with zero cropping AND zero
-        # letterboxing at once. This still uses thumbnail() (not the
-        # cover crop) for the rare case the aspect doesn't match
-        # exactly (e.g. after a live resize away from the frame size
-        # the image was originally fetched for) — showing a thin
+        # this fills the frame with zero cropping AND zero
+        # letterboxing at once, for the rare case the aspect doesn't
+        # match exactly (e.g. after a live resize away from the frame
+        # size the image was originally fetched for) — showing a thin
         # letterbox bar is a much smaller cost than ever hiding either
         # marker.
-        resized = img.copy()
-        resized.thumbnail((fw, fh), _RESAMPLE_LANCZOS)
+        #
+        # Computed manually (not PIL's thumbnail()) — real bug, found
+        # 2026-09-23 shipping the "zoom in ~20%" request: thumbnail()
+        # only ever shrinks, it silently refuses to enlarge an image
+        # past its original size. The server's zoom-in fix works by
+        # sending a deliberately SMALLER image at the same map zoom
+        # (fewer pixels covers proportionally less ground), which
+        # needs the client to scale IT UP to fill the frame — with
+        # thumbnail() that image would render undersized with grey
+        # bars around it instead of appearing zoomed in.
+        scale = min(fw / img.width, fh / img.height)
+        new_w = max(1, round(img.width * scale))
+        new_h = max(1, round(img.height * scale))
+        resized = img.resize((new_w, new_h), _RESAMPLE_LANCZOS)
         ph = ImageTk.PhotoImage(resized)
         map_label.config(image=ph, text="")
         map_label.image = ph  # keep a reference — Tkinter drops it otherwise
