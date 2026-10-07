@@ -203,7 +203,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-26a"
+BUILD_VERSION          = "2026-10-07a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
