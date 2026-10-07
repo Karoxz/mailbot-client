@@ -16,7 +16,7 @@ python -m nuitka ^
   --include-package=PIL ^
   --enable-plugin=tk-inter ^
   --assume-yes-for-downloads ^
-  main.py
+  "main copy.py"
 
 echo Done! EXE is at dist\PlutusBotDispatcher.exe
 pause

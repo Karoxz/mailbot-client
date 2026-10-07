@@ -803,6 +803,24 @@ def _poll_loop():
 # PUBLIC API
 # =============================================================
 
+def driver_has_bot(driver_name: str) -> bool:
+    """True if this driver is configured in driver_config.json with a
+    Telegram chat ID — i.e. the driver bot is actually reachable for
+    them, not just enabled app-wide. Mirrors poller.py's own
+    _driver_has_bot (server/poller.py) — used by main copy.py to hold
+    the dispatcher's own immediate ping back for this driver's matched
+    loads until they bid (client, 2026-10-07: "when driver bot is
+    active for a truck, there is no need for notification for
+    dispatcher for that truck loads until the driver types in the
+    price" — this was only ever wired up server-side before)."""
+    if not driver_name:
+        return False
+    for d in _CFG.get("drivers", []):
+        if d.get("name") == driver_name and d.get("telegram_chat_id"):
+            return True
+    return False
+
+
 def notify_drivers(order_id: str, load_data: dict):
     if not _CFG:
         return

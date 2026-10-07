@@ -9,7 +9,7 @@ from api_client import (call_parse, call_build_bid, call_poll_push,
                          call_set_thread_learning, call_get_thread_learning_status,
                          call_backfill_thread,
                          call_get_telegram_status, call_set_telegram_enabled,
-                         call_route_map)
+                         call_route_map, call_phone_bid_popup_url)
 
 import sys
 import io
@@ -1793,6 +1793,113 @@ def run_thread_learning_backfill(days_back: int = 45) -> dict:
         return {"error": str(e)}
 
 # =============================================================
+# BID PHONE — dispatcher's own popup (2026-10-07)
+# =============================================================
+# "it should be phone map on telegram just like in the web version" —
+# BID PHONE opens bid_price.html as a Telegram web_app popup, same as
+# the web version, instead of a native window on whichever PC happens
+# to be running this app. The server can't create the Gmail draft
+# itself (no server-side Gmail access for a desktop-only license), so
+# the confirmed price relays back through THIS bot/chat as a plain
+# Telegram message (see _phone_bid_popup_url/the "##PHONEBID##"
+# handling in handle_bid_callbacks below) instead.
+
+_PENDING_PHONE_BIDS = {}        # (order_id, truck_idx_or_None) -> on_confirm(price, rate)
+_PENDING_PHONE_BIDS_LOCK = threading.Lock()
+
+
+def _phone_bid_popup_url(order_id: str, truck_idx=None):
+    """Signed bid_price.html popup link for the dispatcher's own BID
+    PHONE — the desktop can't mint the signed token itself (map_token's
+    secret never leaves the server), so it asks for one here, handing
+    over this machine's OWN BOT_TOKEN/CHAT_IDS so the eventual
+    confirmed price relays back through THIS bot/chat (see
+    api_client.call_phone_bid_popup_url's docstring)."""
+    try:
+        with _CHAT_IDS_LOCK:
+            ids = list(CHAT_IDS)
+        return call_phone_bid_popup_url(
+            ACTIVE_LICENSE_KEY, _get_machine_id(), order_id,
+            dispatcher_bot_token=BOT_TOKEN, dispatcher_chat_ids=ids, truck=truck_idx)
+    except Exception as e:
+        print(f"_phone_bid_popup_url failed: {e}")
+        return None
+
+
+def _send_phone_draft_result(order_id, draft_id, price, rate, driver_name=None):
+    who = f"Draft created for {driver_name} — Order #{order_id}" if driver_name \
+        else f"Draft created for Order #{order_id}"
+    per_mile = f" (${rate:.2f}/mi)" if rate else ""
+    if draft_id:
+        draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
+        send_to_telegram_with_buttons(
+            f"✅ {who} — ${price:,.0f}{per_mile}\n"
+            f"Tap below → opens Gmail draft ready to send:",
+            [[{"text": "📨 Open Draft & Send", "url": draft_url}]]
+        )
+    else:
+        send_to_telegram_with_buttons(
+            f"✅ {who} — ${price:,.0f}{per_mile} — open your Drafts:",
+            [[{"text": "📂 Open Gmail Drafts",
+               "url": "https://mail.google.com/mail/u/0/#drafts"}]]
+        )
+
+
+def _make_phone_confirm(service, load, order_id, selected):
+    """Returns on_confirm(price, rate) — same draft-building logic the
+    old native-dialog flow used, just triggered by the relayed popup
+    price instead of _open_bid_price_dialog's own callback."""
+    def _on_confirm(price, rate):
+        if selected:
+            body = _build_bid_body_for_load(load, selected, price, rate)
+        else:
+            body = _build_bid_body_for_order(order_id, price, rate)
+        if not body:
+            return
+        try:
+            original_msg = load.get("original_msg_full", {})
+            draft    = create_reply_draft(service, original_msg, body)
+            draft_id = draft.get("id", "")
+            _bid_id  = _record_bid(load, "phone", selected, bid_amount=price)
+            _send_phone_draft_result(order_id, draft_id, price, rate,
+                                     selected["driver_name"] if selected else None)
+        except Exception as e:
+            print("Phone callback failed:", e)
+            send_to_telegram(f"❌ Failed to create draft: {e}")
+    return _on_confirm
+
+
+def _parse_phone_bid_relay(text: str):
+    """Parses the "##PHONEBID## order truck price rate" marker message
+    /api/web/bid_price/submit relays back (main.py's method=phone +
+    desktop_relay branch) — "-" means that field was absent. Returns
+    (order_id, truck_idx_or_None, price, rate_or_None) or None."""
+    if not text or not text.startswith("##PHONEBID## "):
+        return None
+    parts = text[len("##PHONEBID## "):].split()
+    if len(parts) != 4:
+        return None
+    order_id, truck_raw, price_raw, rate_raw = parts
+    try:
+        price = float(price_raw)
+    except ValueError:
+        return None
+    truck_idx = None
+    if truck_raw != "-":
+        try:
+            truck_idx = int(truck_raw)
+        except ValueError:
+            pass
+    rate = None
+    if rate_raw != "-":
+        try:
+            rate = float(rate_raw)
+        except ValueError:
+            pass
+    return order_id, truck_idx, price, rate
+
+
+# =============================================================
 # TELEGRAM CALLBACK HANDLER — identical to original
 # =============================================================
 
@@ -1808,8 +1915,25 @@ def handle_bid_callbacks(service):
     for upd in updates:
         # Plain (non-callback) messages — e.g. a dispatcher typing in the
         # chat — nothing to do with them since the ForceReply rate-prompt
-        # flow was removed (2026-09-09); only callback_query updates
-        # (button taps) matter below.
+        # flow was removed (2026-09-09), EXCEPT the one new kind BID
+        # PHONE's popup relay sends back (2026-10-07, see
+        # _parse_phone_bid_relay's docstring): the server can't create
+        # the Gmail draft itself for a desktop-only license, so it
+        # relays the confirmed price back as a message on this same
+        # bot/chat instead of a callback_query.
+        msg = upd.get("message")
+        if msg and not upd.get("callback_query"):
+            relay = _parse_phone_bid_relay((msg.get("text") or "").strip())
+            if relay:
+                r_order_id, r_truck_idx, r_price, r_rate = relay
+                with _PENDING_PHONE_BIDS_LOCK:
+                    on_confirm = _PENDING_PHONE_BIDS.pop((r_order_id, r_truck_idx), None)
+                if on_confirm:
+                    on_confirm(r_price, r_rate)
+                else:
+                    print(f"[PHONEBID] no pending popup for order={r_order_id} truck={r_truck_idx} "
+                         f"(stale/duplicate relay?) — ignored")
+            continue
         if not upd.get("callback_query"):
             continue
 
@@ -1914,22 +2038,22 @@ def handle_bid_callbacks(service):
                 )
 
         # ── BID PHONE ─────────────────────────────────────────────────────
-        # Changed 2026-10-07 (client: "implement the new changes to
-        # desktop version as well, only change bid phone... to be the
-        # same as the web version" — the web's bid_price.html BID PHONE
-        # was already changed to "show the map with the bid amount,
-        # just like the pc version" and create a REAL draft with the
-        # confirmed price baked in, instead of price-less. This reuses
-        # the exact same _open_bid_price_dialog BID PC already opens
-        # (map + price, auto-closes itself on confirm — see its own
-        # docstring, nothing new needed there), just building a REAL
-        # draft body (create_reply_draft's non-empty path) instead of
-        # BID PC's clipboard-copy, and instead of the old empty draft.
-        # Unlike the web page, the desktop dialog has no in-window
-        # success state once it closes, so (unlike the web's phone
-        # branch) the "Draft created, tap to open" Telegram message
-        # stays — it's the dispatcher's only way to know it worked and
-        # get to the draft, not a redundant copy/paste nudge.
+        # Changed 2026-10-07 (client, 2nd round: "when i pressed bid
+        # phone, it opened normal map on pc, it should be phone map on
+        # telegram just like in the web version") — BID PHONE is for
+        # when the dispatcher is AWAY from their PC; the native
+        # _open_bid_price_dialog (same one BID PC uses) pops up a
+        # window ON THIS MACHINE regardless of which device the
+        # dispatcher is actually holding, defeating the entire point of
+        # a separate "phone" button. Now opens the SAME bid_price.html
+        # popup (map + price) the web version's BID PHONE opens, as a
+        # Telegram web_app button sent to wherever the dispatcher
+        # pressed BID PHONE from. The server has no Gmail access for a
+        # desktop-only license, so the confirmed price relays back
+        # through THIS bot/chat (see _phone_bid_popup_url's docstring)
+        # instead of a server-side draft — the relay message is picked
+        # up below (the "message" branch of this same polling loop) and
+        # finishes the job with the exact same draft-building logic.
         elif data.startswith("phone:"):
             parts    = data.split(":")
             order_id = parts[1]
@@ -1939,76 +2063,42 @@ def handle_bid_callbacks(service):
             if not load:
                 continue
 
-            all_trucks = load.get("all_trucks", [])
+            all_trucks     = load.get("all_trucks", [])
+            presser_id     = (cq.get("from") or {}).get("id")
+            origin_chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
 
-            def _send_phone_draft_result(order_id, draft_id, price, rate, driver_name=None):
-                who = f"Draft created for {driver_name} — Order #{order_id}" if driver_name \
-                    else f"Draft created for Order #{order_id}"
-                per_mile = f" (${rate:.2f}/mi)" if rate else ""
-                if draft_id:
-                    draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
-                    send_to_telegram_with_buttons(
-                        f"✅ {who} — ${price:,.0f}{per_mile}\n"
-                        f"Tap below → opens Gmail draft ready to send:",
-                        [[{"text": "📨 Open Draft & Send", "url": draft_url}]]
-                    )
-                else:
-                    send_to_telegram_with_buttons(
-                        f"✅ {who} — ${price:,.0f}{per_mile} — open your Drafts:",
-                        [[{"text": "📂 Open Gmail Drafts",
-                           "url": "https://mail.google.com/mail/u/0/#drafts"}]]
-                    )
+            def _open_phone_popup(order_id, truck_idx, on_confirm):
+                url = _phone_bid_popup_url(order_id, truck_idx)
+                if not url:
+                    send_to_telegram(f"⚠️ Could not open the price page for Order #{order_id} "
+                                     f"— contact support.")
+                    return
+                with _PENDING_PHONE_BIDS_LOCK:
+                    _PENDING_PHONE_BIDS[(str(order_id), truck_idx)] = on_confirm
+                prompt_text = f"💰 Order #{order_id} — tap below to enter your rate:"
+                keyboard = {"inline_keyboard": [[{"text": "💵 Enter price", "web_app": {"url": url}}]]}
+                # Telegram refuses to let a bot DM a user who's never
+                # messaged that bot privately first — exact same rule
+                # (and fallback) as the driver bot's own popup. Falls
+                # back to a plain link in the ORIGIN chat (no web_app
+                # there either — Telegram platform limit for groups).
+                if presser_id and _telegram_send_one(presser_id, {"text": prompt_text, "reply_markup": keyboard}):
+                    return
+                if origin_chat_id:
+                    _telegram_send_one(origin_chat_id,
+                                       {"text": f"{prompt_text}\n{url}"})
 
             if len(parts) > 2:
-                # Driver already selected — show the price dialog, THEN draft
+                # Driver already selected — open the popup, THEN draft
                 truck_idx = int(parts[2])
                 if truck_idx >= len(all_trucks):
                     continue
                 selected = all_trucks[truck_idx]
-
-                def _do_phone_bid_multi(price, rate, load=load, order_id=order_id,
-                                        selected=selected):
-                    body = _build_bid_body_for_load(load, selected, price, rate)
-                    if not body:
-                        return
-                    try:
-                        original_msg = load.get("original_msg_full", {})
-                        draft    = create_reply_draft(service, original_msg, body)
-                        draft_id = draft.get("id", "")
-                        _bid_id  = _record_bid(load, "phone", selected, bid_amount=price)
-                        _send_phone_draft_result(order_id, draft_id, price, rate, selected["driver_name"])
-                    except Exception as e:
-                        print("Phone callback failed:", e)
-                        send_to_telegram(f"❌ Failed to create draft: {e}")
-
-                if _APP_ROOT is not None:
-                    # Same late-binding fix as BID PC's own scheduling above.
-                    _APP_ROOT.after(
-                        0, lambda order_id=order_id, load=load, selected=selected,
-                                  cb=_do_phone_bid_multi:
-                            _open_bid_price_dialog(order_id, load, selected, cb))
+                _open_phone_popup(order_id, truck_idx, _make_phone_confirm(service, load, order_id, selected))
 
             elif not all_trucks or len(all_trucks) == 1:
-                # Only one driver — show the price dialog, THEN draft
-                def _do_phone_bid_single(price, rate, load=load, order_id=order_id):
-                    body = _build_bid_body_for_order(order_id, price, rate)
-                    if not body:
-                        return
-                    try:
-                        original_msg = load.get("original_msg_full", {})
-                        draft    = create_reply_draft(service, original_msg, body)
-                        draft_id = draft.get("id", "")
-                        _bid_id  = _record_bid(load, "phone", bid_amount=price)
-                        _send_phone_draft_result(order_id, draft_id, price, rate)
-                    except Exception as e:
-                        print("Phone callback failed:", e)
-                        send_to_telegram(f"❌ Failed to create draft: {e}")
-
-                if _APP_ROOT is not None:
-                    _APP_ROOT.after(
-                        0, lambda order_id=order_id, load=load,
-                                  cb=_do_phone_bid_single:
-                            _open_bid_price_dialog(order_id, load, None, cb))
+                # Only one driver — open the popup, THEN draft
+                _open_phone_popup(order_id, None, _make_phone_confirm(service, load, order_id, None))
 
             else:
                 # Multiple drivers — show selection
@@ -2489,20 +2579,40 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
 
             if formatted:
                 _route_url = None
+                _matched_driver = None
                 with LOAD_STORE_LOCK:
                     _ld = LOAD_STORE.get(order)
                     if _ld:
                         _route_url = _ld.get("route_url")
-                _tg_ok = send_to_telegram(formatted, bid_order_id=order,
-                                          mobile_thread_url=mobile_bid_url,
-                                          route_url=_route_url)
-                if _tg_ok:
-                    _log(f"[{ts}] ✅ #{order}{gmid_tag}  →  sent to Telegram")
-                elif not _TELEGRAM_ENABLED:
-                    _log(f"[{ts}] ⏸ #{order}{gmid_tag}  →  Telegram is OFF, not sent")
+                        _matched_driver = _ld.get("driver_name")
+
+                # Client, 2026-10-07: "when driver bot is active for a
+                # truck, there is no need for notification for
+                # dispatcher for that truck loads until the driver
+                # types in the price" — only ever wired up server-side
+                # (poller.py's _deliver_to_dispatcher) before; the
+                # matched driver hears about it via the driver bot card
+                # below regardless, and the dispatcher hears about it
+                # once that driver actually bids (forward_bid, same as
+                # before this held anything back).
+                _driver_bot_active = bool(
+                    _DRIVER_BOT_ENABLED and driver_bot is not None
+                    and driver_bot.driver_has_bot(_matched_driver))
+
+                if _driver_bot_active:
+                    _log(f"[{ts}] ⏸ #{order}{gmid_tag}  →  matched to {_matched_driver} — "
+                        f"driver bot active, holding the dispatcher ping until they bid")
                 else:
-                    _log(f"[{ts}] ❌ #{order}{gmid_tag}  →  Telegram send FAILED "
-                        f"(check chat ID / bot token — see log file for details)")
+                    _tg_ok = send_to_telegram(formatted, bid_order_id=order,
+                                              mobile_thread_url=mobile_bid_url,
+                                              route_url=_route_url)
+                    if _tg_ok:
+                        _log(f"[{ts}] ✅ #{order}{gmid_tag}  →  sent to Telegram")
+                    elif not _TELEGRAM_ENABLED:
+                        _log(f"[{ts}] ⏸ #{order}{gmid_tag}  →  Telegram is OFF, not sent")
+                    else:
+                        _log(f"[{ts}] ❌ #{order}{gmid_tag}  →  Telegram send FAILED "
+                            f"(check chat ID / bot token — see log file for details)")
 
                 # Driver bot — independent of the dispatcher send above
                 # (own bot, own chat(s), own failure mode; a dispatcher
