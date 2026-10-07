@@ -202,7 +202,7 @@ def _resolve_logo_path(configured_path: str, fallback_name: str) -> str:
 # actual code issue (confirmed via direct code search + a fresh
 # launch test, twice) — this makes "which build is this, really"
 # instantly checkable without any back-and-forth investigation.
-BUILD_VERSION          = "2026-09-23b"
+BUILD_VERSION          = "2026-09-26a"
 
 # Rotated 2026-09-16 — the previous tokens leaked via the (now private)
 # public GitHub repo and were actively abused (see MAILBOT_ROADMAP.md's
@@ -765,6 +765,22 @@ def _force_window_foreground(win: tk.Toplevel) -> None:
         print(f"[BID-DIALOG] force-foreground failed: {e}")
 
 
+def _screen_work_area(win, sw, sh):
+    """(x, y, w, h) of the primary monitor's usable area (excludes the
+    taskbar). Falls back to the full screen if the query fails."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            aw, ah = rect.right - rect.left, rect.bottom - rect.top
+            if aw > 200 and ah > 200:
+                return rect.left, rect.top, aw, ah
+    except Exception:
+        pass
+    return 0, 0, sw, sh
+
+
 def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_confirm):
     """
     New feature, 2026-09-19 (client request, modeled on a load-board
@@ -839,12 +855,23 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         # the map itself now resizes live with the window (see the
         # <Configure> binding below) instead of staying a fixed image
         # size while empty space grows around it.
-        w = min(1400, max(700, int(sw * 0.68)))
-        h = min(1000, max(760, int(sh * 0.82)))
-        x = (sw - w) // 2
-        y = max(20, (sh - h) // 2 - 20)
+        # 2026-09-26 (client: map "cropped and pixelated" on his PC
+        # monitor, fine on the dev laptop): sized against the usable
+        # WORK AREA (screen minus taskbar), not the raw screen — on
+        # shorter/highly-scaled monitors the old 760px floor pushed the
+        # bottom of the dialog under the taskbar. Width is capped at
+        # 1250 (was 1400): the server's map image tops out around
+        # ~1070px on its long side, so a wider frame only stretched it
+        # into a soft, pixelated picture.
+        ax, ay, aw, ah = _screen_work_area(win, sw, sh)
+        w = min(1250, max(700, int(aw * 0.68)))
+        h = min(1000, max(760, int(ah * 0.82)))
+        w = min(w, aw - 20)
+        h = min(h, ah - 20)
+        x = ax + (aw - w) // 2
+        y = ay + max(10, (ah - h) // 2)
         win.geometry(f"{w}x{h}+{x}+{y}")
-        win.minsize(560, 640)
+        win.minsize(min(560, w), min(640, h))
         # Deliberately NOT win.transient(_APP_ROOT) — see the docstring
         # note above. This dialog stands on its own; it doesn't need
         # to be OS-owned by (and inherit the minimized state of) the
@@ -957,7 +984,12 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         # needs the client to scale IT UP to fill the frame — with
         # thumbnail() that image would render undersized with grey
         # bars around it instead of appearing zoomed in.
-        scale = min(fw / img.width, fh / img.height)
+        # Upscale capped at 1.15x (2026-09-26): the source image is
+        # ~1070px at most (Static Maps limit), so stretching it far
+        # past that on a big monitor is what made it look pixelated.
+        # Beyond the cap it stays centred on the frame's own
+        # background instead of blowing up.
+        scale = min(fw / img.width, fh / img.height, 1.15)
         new_w = max(1, round(img.width * scale))
         new_h = max(1, round(img.height * scale))
         resized = img.resize((new_w, new_h), _RESAMPLE_LANCZOS)
@@ -972,10 +1004,12 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
                                 frame_w=frame_w, frame_h=frame_h)
 
         def _apply():
+            _map_state["fetching"] = False
             if not map_label.winfo_exists():
                 return  # dialog closed before the fetch finished
             if not result or not result.get("success"):
-                map_label.config(text="Map unavailable")
+                if _map_state["original"] is None:
+                    map_label.config(text="Map unavailable")
                 return
             try:
                 raw = base64.b64decode(result["image_b64"])
@@ -1000,17 +1034,39 @@ def _open_bid_price_dialog(order_id: str, load: dict, truck: Optional[dict], on_
         # window is actually mapped/shown (later in this function), so
         # waiting for that — instead of trying to force it early — is
         # what actually gives the server accurate dimensions to match.
-        if _map_state["fetch_started"]:
-            return
         fw = map_frame.winfo_width()
         fh = map_frame.winfo_height()
         if fw < 10 or fh < 10:
             return  # still not really laid out yet — a later <Configure> will retry
+        if _map_state["fetch_started"]:
+            # Re-request when the frame's shape has changed materially
+            # (window resized/maximized) so the server's aspect-matched
+            # image still fits without bars. Old image stays until the
+            # new one arrives.
+            prev = _map_state.get("fetched_ratio")
+            if prev and not _map_state.get("fetching")                     and abs((fw / fh) / prev - 1) > 0.15:
+                _map_state["fetching"] = True
+                _map_state["fetched_ratio"] = fw / fh
+                threading.Thread(target=_load_map, args=(fw, fh), daemon=True).start()
+            return
         _map_state["fetch_started"] = True
+        _map_state["fetching"] = True
+        _map_state["fetched_ratio"] = fw / fh
         threading.Thread(target=_load_map, args=(fw, fh), daemon=True).start()
 
     def _on_map_frame_configure(_event):
-        _start_map_fetch_if_ready()
+        # First fetch immediately (dialog just opened), later ones only
+        # once the drag/resize has settled.
+        if not _map_state["fetch_started"]:
+            _start_map_fetch_if_ready()
+        else:
+            sj = _map_state.get("settle_job")
+            if sj is not None:
+                try:
+                    map_frame.after_cancel(sj)
+                except Exception:
+                    pass
+            _map_state["settle_job"] = map_frame.after(400, _start_map_fetch_if_ready)
         # Debounced — <Configure> fires continuously while the user
         # drags a resize handle; re-thumbnailing on every single event
         # would be wasteful and can lag the drag itself.
@@ -1858,6 +1914,22 @@ def handle_bid_callbacks(service):
                 )
 
         # ── BID PHONE ─────────────────────────────────────────────────────
+        # Changed 2026-10-07 (client: "implement the new changes to
+        # desktop version as well, only change bid phone... to be the
+        # same as the web version" — the web's bid_price.html BID PHONE
+        # was already changed to "show the map with the bid amount,
+        # just like the pc version" and create a REAL draft with the
+        # confirmed price baked in, instead of price-less. This reuses
+        # the exact same _open_bid_price_dialog BID PC already opens
+        # (map + price, auto-closes itself on confirm — see its own
+        # docstring, nothing new needed there), just building a REAL
+        # draft body (create_reply_draft's non-empty path) instead of
+        # BID PC's clipboard-copy, and instead of the old empty draft.
+        # Unlike the web page, the desktop dialog has no in-window
+        # success state once it closes, so (unlike the web's phone
+        # branch) the "Draft created, tap to open" Telegram message
+        # stays — it's the dispatcher's only way to know it worked and
+        # get to the draft, not a redundant copy/paste nudge.
         elif data.startswith("phone:"):
             parts    = data.split(":")
             order_id = parts[1]
@@ -1869,69 +1941,74 @@ def handle_bid_callbacks(service):
 
             all_trucks = load.get("all_trucks", [])
 
+            def _send_phone_draft_result(order_id, draft_id, price, rate, driver_name=None):
+                who = f"Draft created for {driver_name} — Order #{order_id}" if driver_name \
+                    else f"Draft created for Order #{order_id}"
+                per_mile = f" (${rate:.2f}/mi)" if rate else ""
+                if draft_id:
+                    draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
+                    send_to_telegram_with_buttons(
+                        f"✅ {who} — ${price:,.0f}{per_mile}\n"
+                        f"Tap below → opens Gmail draft ready to send:",
+                        [[{"text": "📨 Open Draft & Send", "url": draft_url}]]
+                    )
+                else:
+                    send_to_telegram_with_buttons(
+                        f"✅ {who} — ${price:,.0f}{per_mile} — open your Drafts:",
+                        [[{"text": "📂 Open Gmail Drafts",
+                           "url": "https://mail.google.com/mail/u/0/#drafts"}]]
+                    )
+
             if len(parts) > 2:
-                # Driver already selected
+                # Driver already selected — show the price dialog, THEN draft
                 truck_idx = int(parts[2])
                 if truck_idx >= len(all_trucks):
                     continue
                 selected = all_trucks[truck_idx]
-                body = _build_bid_body_for_load(load, selected)
-                if not body:
-                    continue
-                try:
-                    send_to_telegram(body)
-                    original_msg = load.get("original_msg_full", {})
-                    draft    = create_reply_draft(service, original_msg, "", None, empty=True)
-                    draft_id = draft.get("id", "")
-                    _bid_id = _record_bid(load, "phone", selected)
-                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
-                    # now fills in automatically via thread learning instead)
-                    if draft_id:
-                        draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
-                        send_to_telegram_with_buttons(
-                            f"✅ Draft created for {selected['driver_name']} — Order #{order_id}\n"
-                            f"Tap below → opens Gmail draft ready to send:",
-                            [[{"text": "📨 Open Draft & Send", "url": draft_url}]]
-                        )
-                    else:
-                        send_to_telegram_with_buttons(
-                            f"✅ Draft created for Order #{order_id} — open your Drafts:",
-                            [[{"text": "📂 Open Gmail Drafts",
-                               "url": "https://mail.google.com/mail/u/0/#drafts"}]]
-                        )
-                except Exception as e:
-                    print("Phone callback failed:", e)
-                    send_to_telegram(f"❌ Failed to create draft: {e}")
+
+                def _do_phone_bid_multi(price, rate, load=load, order_id=order_id,
+                                        selected=selected):
+                    body = _build_bid_body_for_load(load, selected, price, rate)
+                    if not body:
+                        return
+                    try:
+                        original_msg = load.get("original_msg_full", {})
+                        draft    = create_reply_draft(service, original_msg, body)
+                        draft_id = draft.get("id", "")
+                        _bid_id  = _record_bid(load, "phone", selected, bid_amount=price)
+                        _send_phone_draft_result(order_id, draft_id, price, rate, selected["driver_name"])
+                    except Exception as e:
+                        print("Phone callback failed:", e)
+                        send_to_telegram(f"❌ Failed to create draft: {e}")
+
+                if _APP_ROOT is not None:
+                    # Same late-binding fix as BID PC's own scheduling above.
+                    _APP_ROOT.after(
+                        0, lambda order_id=order_id, load=load, selected=selected,
+                                  cb=_do_phone_bid_multi:
+                            _open_bid_price_dialog(order_id, load, selected, cb))
 
             elif not all_trucks or len(all_trucks) == 1:
-                # Single driver — proceed directly
-                body = _build_bid_body_for_order(order_id)
-                if not body:
-                    continue
-                try:
-                    send_to_telegram(body)
-                    original_msg = load.get("original_msg_full", {})
-                    draft    = create_reply_draft(service, original_msg, "", None, empty=True)
-                    draft_id = draft.get("id", "")
-                    _bid_id = _record_bid(load, "phone")
-                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
-                    # now fills in automatically via thread learning instead)
-                    if draft_id:
-                        draft_url = f"https://mail.google.com/mail/u/0/#drafts/{draft_id}"
-                        send_to_telegram_with_buttons(
-                            f"✅ Draft created for Order #{order_id}\n"
-                            f"Tap below → opens Gmail draft ready to send:",
-                            [[{"text": "📨 Open Draft & Send", "url": draft_url}]]
-                        )
-                    else:
-                        send_to_telegram_with_buttons(
-                            f"✅ Draft created for Order #{order_id} — open your Drafts:",
-                            [[{"text": "📂 Open Gmail Drafts",
-                               "url": "https://mail.google.com/mail/u/0/#drafts"}]]
-                        )
-                except Exception as e:
-                    print("Phone callback failed:", e)
-                    send_to_telegram(f"❌ Failed to create draft: {e}")
+                # Only one driver — show the price dialog, THEN draft
+                def _do_phone_bid_single(price, rate, load=load, order_id=order_id):
+                    body = _build_bid_body_for_order(order_id, price, rate)
+                    if not body:
+                        return
+                    try:
+                        original_msg = load.get("original_msg_full", {})
+                        draft    = create_reply_draft(service, original_msg, body)
+                        draft_id = draft.get("id", "")
+                        _bid_id  = _record_bid(load, "phone", bid_amount=price)
+                        _send_phone_draft_result(order_id, draft_id, price, rate)
+                    except Exception as e:
+                        print("Phone callback failed:", e)
+                        send_to_telegram(f"❌ Failed to create draft: {e}")
+
+                if _APP_ROOT is not None:
+                    _APP_ROOT.after(
+                        0, lambda order_id=order_id, load=load,
+                                  cb=_do_phone_bid_single:
+                            _open_bid_price_dialog(order_id, load, None, cb))
 
             else:
                 # Multiple drivers — show selection

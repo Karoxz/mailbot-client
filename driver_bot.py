@@ -278,6 +278,39 @@ def _answer_callback(callback_query_id: str, text: str = ""):
         "text": text,
     })
 
+
+def _web_app_ok(chat_id) -> bool:
+    """Telegram only allows web_app buttons in PRIVATE chats (positive
+    ids) — same rule the web driver bot enforces (server/driver_bot_web.py)."""
+    return isinstance(chat_id, int) and chat_id > 0
+
+
+def _driver_bid_url(order_id: str, driver_name: str, driver_chat_id) -> Optional[str]:
+    """Signed bid_price.html popup link (map + price, no ForceReply) —
+    same page/mechanism the web driver bot's own popup uses. The
+    desktop can't mint the signed token itself (map_token's secret
+    never leaves the server), so it asks the server for the finished
+    URL instead, handing over this machine's OWN dispatcher_bot_token/
+    dispatcher_chat_ids and driver_bot_token/driver_chat_id so the
+    eventual submit relays back through THIS dispatcher's bots/chats
+    (see api_client.call_driver_bid_popup_url's docstring)."""
+    key, mid = _get_credentials()
+    if not key:
+        return None
+    try:
+        from api_client import call_driver_bid_popup_url
+        dispatcher_chat_ids = _CFG.get("dispatcher_chat_ids") or _get_fallback_dispatcher_ids()
+        return call_driver_bid_popup_url(
+            key, mid, order_id, driver_name,
+            dispatcher_bot_token=_CFG.get("dispatcher_bot_token", ""),
+            dispatcher_chat_ids=dispatcher_chat_ids,
+            driver_bot_token=_CFG.get("driver_bot_token", ""),
+            driver_chat_id=driver_chat_id,
+        )
+    except Exception as e:
+        _l(f"_driver_bid_url failed: {e}", "warning")
+        return None
+
 # =============================================================
 # LOAD CARD FORMATTER
 # =============================================================
@@ -528,7 +561,8 @@ def _handle_callback_query(cq: dict):
     cq_id       = cq.get("id", "")
     data        = cq.get("data", "")
     from_user   = cq.get("from", {})
-    chat_id     = from_user.get("id")
+    presser_id  = from_user.get("id")
+    origin_chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
     driver_name_from_tg = from_user.get("first_name", "Driver")
 
     if not data.startswith("driverbid:"):
@@ -543,9 +577,32 @@ def _handle_callback_query(cq: dict):
     order_id    = parts[1]
     driver_name = parts[2]   # name from config, more reliable than TG display name
 
+    # One-tap map+price popup (2026-10-07, client: "driver bot
+    # (@plutus_driver_bot) to be the same as the web version") —
+    # cq["from"]["id"] (whoever actually tapped it) is always an
+    # individual user id, in principle always web_app-eligible
+    # regardless of where the card lived. BUT Telegram still refuses to
+    # let a bot DM a user who's never messaged that bot PRIVATELY first
+    # ("403: bot can't initiate conversation with a user") — exact same
+    # bug found live testing the web driver bot. If the DM fails, fall
+    # back to the ForceReply prompt in the SAME chat the card lives in
+    # (origin_chat_id) — that always works, no prior private DM needed.
+    bid_url = _driver_bid_url(order_id, driver_name, presser_id)
+    if bid_url:
+        prompt_msg_id = _send_to_driver(
+            presser_id, f"💰 Order #{order_id} — tap below to enter your rate:",
+            reply_markup={"inline_keyboard": [[{"text": "💵 Enter price", "web_app": {"url": bid_url}}]]})
+        if prompt_msg_id:
+            _answer_callback(cq_id, "💰 Check your DM with the bot")
+            return
+        _l(f"Rate popup DM failed for {driver_name} (hasn't started a private "
+           f"chat with the bot?) — falling back to a reply prompt in this chat", "warning")
+
     _answer_callback(cq_id, "💰 Enter your rate below")
 
-    # Send ForceReply prompt to driver
+    # Send ForceReply prompt to driver, in the chat the card itself
+    # lives in (not necessarily the presser's own DM — see above).
+    chat_id = origin_chat_id
     prompt_text = (
         f"💰 Order #{order_id}\n"
         f"Type your rate (numbers only):\n"
@@ -778,8 +835,16 @@ def notify_drivers(order_id: str, load_data: dict):
             card_text = f"👤 {name}\n{'─'*30}\n" + _format_load_card(order_id, load_data)
             _l(f"No formatted_message for {order_id} — using brief card", "warning")
 
+        # One-tap map+price popup in private chats (2026-10-07, client:
+        # "driver bot (@plutus_driver_bot) to be the same as the web
+        # version") — same web_app shortcut the web driver bot already
+        # uses; groups keep the plain callback (Telegram platform
+        # limit — web_app buttons only work in private chats).
+        bid_url = _driver_bid_url(order_id, name, chat_id) if _web_app_ok(chat_id) else None
+        bid_button = ({"text": "💰 BID", "web_app": {"url": bid_url}} if bid_url
+                      else {"text": "💰 BID", "callback_data": f"driverbid:{order_id}:{name}"})
         keyboard = {"inline_keyboard": [[
-            {"text": "💰 BID", "callback_data": f"driverbid:{order_id}:{name}"},
+            bid_button,
             *([{"text": "🚩 ROUTE", "url": load_data.get("route_url", "")}]
               if load_data.get("route_url") else [])
         ]]}

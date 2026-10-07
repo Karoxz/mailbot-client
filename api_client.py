@@ -48,6 +48,38 @@ def call_build_bid(license_key, machine_id, load_data) -> Optional[str]:
         print(f"call_build_bid error: {e}")
     return None
 
+def call_driver_bid_popup_url(license_key, machine_id, order_id, driver_name,
+                               dispatcher_bot_token="", dispatcher_chat_ids=None,
+                               driver_bot_token="", driver_chat_id=None) -> Optional[str]:
+    """Driver bot's own BID popup (2026-10-07, client: "driver bot
+    (@plutus_driver_bot) to be the same as the web version") — asks the
+    server for a signed bid_price.html link (map + price, same page the
+    web driver bot's popup already uses). dispatcher_bot_token/
+    dispatcher_chat_ids/driver_bot_token/driver_chat_id (from this
+    machine's driver_config.json) ride along so the server can relay
+    the eventual bid back through THIS dispatcher's own bots/chats
+    instead of license_db's web/standalone settings, which a desktop-
+    only license never sets — see map_token.make_bid_token's
+    desktop_relay and main.py's /api/driver_bid_popup_url."""
+    try:
+        r = _session.post(
+            f"{SERVER_URL}/api/driver_bid_popup_url",
+            json={"license_key": license_key, "machine_id": machine_id,
+                  "order_id": order_id, "driver_name": driver_name,
+                  "dispatcher_bot_token": dispatcher_bot_token,
+                  "dispatcher_chat_ids": dispatcher_chat_ids or [],
+                  "driver_bot_token": driver_bot_token,
+                  "driver_chat_id": driver_chat_id},
+            timeout=8,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success"):
+                return data.get("url")
+    except Exception as e:
+        print(f"call_driver_bid_popup_url error: {e}")
+    return None
+
 def call_route_map(license_key, machine_id, pickup_loc, delivery_loc,
                     frame_w=None, frame_h=None) -> Optional[dict]:
     """
