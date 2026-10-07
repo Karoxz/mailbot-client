@@ -34,6 +34,7 @@ import base64
 import json
 import requests
 import threading
+import traceback
 import tkinter as tk
 from tkinter import messagebox
 from urllib.parse import quote
@@ -1941,295 +1942,313 @@ def handle_bid_callbacks(service):
             relay = _parse_phone_bid_relay((msg.get("text") or "").strip())
             if relay:
                 r_order_id, r_truck_idx, r_price, r_rate = relay
-                with LOAD_STORE_LOCK:
-                    r_load = LOAD_STORE.get(r_order_id)
-                if not r_load:
-                    print(f"[PHONEBID] relay for order={r_order_id} — load no longer in LOAD_STORE "
-                         f"(restarted since?) — ignored")
-                else:
-                    r_trucks = r_load.get("all_trucks", [])
-                    r_selected = (r_trucks[r_truck_idx]
-                                 if r_truck_idx is not None and r_truck_idx < len(r_trucks) else None)
-                    _make_phone_confirm(service, r_load, r_order_id, r_selected)(r_price, r_rate)
+                _flog("info", f"[PHONEBID] relay received: order={r_order_id} "
+                              f"truck={r_truck_idx} price={r_price} rate={r_rate}")
+                try:
+                    with LOAD_STORE_LOCK:
+                        r_load = LOAD_STORE.get(r_order_id)
+                    if not r_load:
+                        _flog("warning", f"[PHONEBID] order={r_order_id} — load no longer in "
+                                        f"LOAD_STORE (restarted since?) — ignored")
+                    else:
+                        r_trucks = r_load.get("all_trucks", [])
+                        r_selected = (r_trucks[r_truck_idx]
+                                     if r_truck_idx is not None and r_truck_idx < len(r_trucks) else None)
+                        _make_phone_confirm(service, r_load, r_order_id, r_selected)(r_price, r_rate)
+                        _flog("info", f"[PHONEBID] order={r_order_id} — draft handling completed")
+                except Exception as e:
+                    _flog("error", f"[PHONEBID] order={r_order_id} failed: {e}\n{traceback.format_exc()}")
             continue
         if not upd.get("callback_query"):
             continue
 
-        cq = upd.get("callback_query")
-        if not cq:
-            continue
-        data = cq.get("data", "")
-        cqid = cq.get("id")
-        answer_callback_query(cqid, "")
-
-        # ── BID PC ────────────────────────────────────────────────────────
-        if data.startswith("bid:"):
-            parts    = data.split(":")
-            order_id = parts[1]
-
-            with LOAD_STORE_LOCK:
-                load = LOAD_STORE.get(order_id)
-            if not load:
+        try:
+            cq = upd.get("callback_query")
+            if not cq:
                 continue
+            data = cq.get("data", "")
+            cqid = cq.get("id")
+            answer_callback_query(cqid, "")
 
-            all_trucks = load.get("all_trucks", [])
-            print(f"[DEBUG] Order {order_id}: all_trucks={len(all_trucks)} -> {[t.get('driver_name') for t in all_trucks]}")
-            if len(parts) > 2:
-                # Driver already selected — show the price dialog, THEN bid
-                truck_idx = int(parts[2])
-                if truck_idx >= len(all_trucks):
+            # ── BID PC ────────────────────────────────────────────────────────
+            if data.startswith("bid:"):
+                parts    = data.split(":")
+                order_id = parts[1]
+
+                with LOAD_STORE_LOCK:
+                    load = LOAD_STORE.get(order_id)
+                if not load:
                     continue
-                selected = all_trucks[truck_idx]
 
-                def _do_pc_bid_multi(price, rate, load=load, order_id=order_id,
-                                     selected=selected):
-                    body = _build_bid_body_for_load(load, selected, price, rate)
-                    if not body:
-                        return
-                    try:
-                        pyperclip.copy(body)
-                        _open_bid_thread(order_id, load)
-                        _bid_id = _record_bid(load, "pc", selected, bid_amount=price)
-                        send_to_telegram(
-                            f"📋 Bid for {selected['driver_name']} copied — "
-                            f"${price:,.0f} (${rate:.2f}/mi). Press Reply and paste (Ctrl+V)."
-                            if rate else
-                            f"📋 Bid for {selected['driver_name']} copied — "
-                            f"${price:,.0f}. Press Reply and paste (Ctrl+V).")
-                    except Exception as e:
-                        print("Bid callback failed:", e)
+                all_trucks = load.get("all_trucks", [])
+                print(f"[DEBUG] Order {order_id}: all_trucks={len(all_trucks)} -> {[t.get('driver_name') for t in all_trucks]}")
+                if len(parts) > 2:
+                    # Driver already selected — show the price dialog, THEN bid
+                    truck_idx = int(parts[2])
+                    if truck_idx >= len(all_trucks):
+                        continue
+                    selected = all_trucks[truck_idx]
 
-                if _APP_ROOT is not None:
-                    # Default-arg capture, not a bare closure — real bug
-                    # avoided here: handle_bid_callbacks can schedule
-                    # several of these in one poll batch (two BID PC
-                    # taps arriving together) before the Tk main thread
-                    # gets around to running any of them, and by then
-                    # this loop has already moved on to the NEXT cq's
-                    # order_id/load/selected. A bare lambda would look
-                    # those names up at call time and get the wrong
-                    # order's data; freezing them as defaults snapshots
-                    # the values at schedule time instead.
-                    _APP_ROOT.after(
-                        0, lambda order_id=order_id, load=load, selected=selected,
-                                  cb=_do_pc_bid_multi:
-                            _open_bid_price_dialog(order_id, load, selected, cb))
+                    def _do_pc_bid_multi(price, rate, load=load, order_id=order_id,
+                                         selected=selected):
+                        body = _build_bid_body_for_load(load, selected, price, rate)
+                        if not body:
+                            return
+                        try:
+                            pyperclip.copy(body)
+                            _open_bid_thread(order_id, load)
+                            _bid_id = _record_bid(load, "pc", selected, bid_amount=price)
+                            send_to_telegram(
+                                f"📋 Bid for {selected['driver_name']} copied — "
+                                f"${price:,.0f} (${rate:.2f}/mi). Press Reply and paste (Ctrl+V)."
+                                if rate else
+                                f"📋 Bid for {selected['driver_name']} copied — "
+                                f"${price:,.0f}. Press Reply and paste (Ctrl+V).")
+                        except Exception as e:
+                            print("Bid callback failed:", e)
 
-            elif not all_trucks or len(all_trucks) == 1:
-                # Only one driver — show the price dialog, THEN proceed
-                def _do_pc_bid_single(price, rate, load=load, order_id=order_id):
-                    body = _build_bid_body_for_order(order_id, price, rate)
-                    if not body:
-                        return
-                    try:
-                        pyperclip.copy(body)
-                        _open_bid_thread(order_id, load)
-                        _bid_id = _record_bid(load, "pc", bid_amount=price)
-                        send_to_telegram(
-                            f"📋 Bid text copied — ${price:,.0f} (${rate:.2f}/mi). "
-                            f"Press Reply and paste (Ctrl+V)."
-                            if rate else
-                            f"📋 Bid text copied — ${price:,.0f}. Press Reply and paste (Ctrl+V).")
-                    except Exception as e:
-                        print("Bid callback failed:", e)
+                    if _APP_ROOT is not None:
+                        # Default-arg capture, not a bare closure — real bug
+                        # avoided here: handle_bid_callbacks can schedule
+                        # several of these in one poll batch (two BID PC
+                        # taps arriving together) before the Tk main thread
+                        # gets around to running any of them, and by then
+                        # this loop has already moved on to the NEXT cq's
+                        # order_id/load/selected. A bare lambda would look
+                        # those names up at call time and get the wrong
+                        # order's data; freezing them as defaults snapshots
+                        # the values at schedule time instead.
+                        _APP_ROOT.after(
+                            0, lambda order_id=order_id, load=load, selected=selected,
+                                      cb=_do_pc_bid_multi:
+                                _open_bid_price_dialog(order_id, load, selected, cb))
 
-                if _APP_ROOT is not None:
-                    # Same late-binding fix as the branch above.
-                    _APP_ROOT.after(
-                        0, lambda order_id=order_id, load=load,
-                                  cb=_do_pc_bid_single:
-                            _open_bid_price_dialog(order_id, load, None, cb))
+                elif not all_trucks or len(all_trucks) == 1:
+                    # Only one driver — show the price dialog, THEN proceed
+                    def _do_pc_bid_single(price, rate, load=load, order_id=order_id):
+                        body = _build_bid_body_for_order(order_id, price, rate)
+                        if not body:
+                            return
+                        try:
+                            pyperclip.copy(body)
+                            _open_bid_thread(order_id, load)
+                            _bid_id = _record_bid(load, "pc", bid_amount=price)
+                            send_to_telegram(
+                                f"📋 Bid text copied — ${price:,.0f} (${rate:.2f}/mi). "
+                                f"Press Reply and paste (Ctrl+V)."
+                                if rate else
+                                f"📋 Bid text copied — ${price:,.0f}. Press Reply and paste (Ctrl+V).")
+                        except Exception as e:
+                            print("Bid callback failed:", e)
 
-            else:
-                # Multiple drivers — show selection
-                buttons = []
-                for i, truck in enumerate(all_trucks):
-                    name = truck.get("driver_name", f"Driver {i+1}")
-                    dh   = truck.get("google_deadhead", "?")
-                    buttons.append([{
-                        "text":          f"🚛 {name}  —  {dh} mi out",
-                        "callback_data": f"bid:{order_id}:{i}",
-                    }])
-                send_to_telegram_with_buttons(
-                    f"👤 Select driver for Order #{order_id}:",
-                    buttons
-                )
+                    if _APP_ROOT is not None:
+                        # Same late-binding fix as the branch above.
+                        _APP_ROOT.after(
+                            0, lambda order_id=order_id, load=load,
+                                      cb=_do_pc_bid_single:
+                                _open_bid_price_dialog(order_id, load, None, cb))
 
-        # ── BID PHONE ─────────────────────────────────────────────────────
-        # Changed 2026-10-07 (client, 2nd round: "when i pressed bid
-        # phone, it opened normal map on pc, it should be phone map on
-        # telegram just like in the web version") — BID PHONE is for
-        # when the dispatcher is AWAY from their PC; the native
-        # _open_bid_price_dialog (same one BID PC uses) pops up a
-        # window ON THIS MACHINE regardless of which device the
-        # dispatcher is actually holding, defeating the entire point of
-        # a separate "phone" button. Now opens the SAME bid_price.html
-        # popup (map + price) the web version's BID PHONE opens, as a
-        # Telegram web_app button sent to wherever the dispatcher
-        # pressed BID PHONE from. The server has no Gmail access for a
-        # desktop-only license, so the confirmed price relays back
-        # through THIS bot/chat (see _phone_bid_popup_url's docstring)
-        # instead of a server-side draft — the relay message is picked
-        # up below (the "message" branch of this same polling loop) and
-        # finishes the job with the exact same draft-building logic.
-        elif data.startswith("phone:"):
-            # Reaching THIS callback at all (private single-truck loads
-            # now get a direct web_app button on the original message,
-            # never a callback — see send_to_telegram's phone_url) means
-            # either a group chat (web_app doesn't work there at all —
-            # Telegram platform limit) or a multi-truck load that still
-            # needs a driver picked first. Either way: fall back to
-            # DMing the presser their own popup, and if THAT fails too
-            # (never messaged the bot privately — same 403 rule the
-            # driver bot's own popup hit), a plain link in the chat the
-            # card lives in. No pending-callback bookkeeping needed —
-            # the relay handler below re-derives load/selected from
-            # LOAD_STORE by order_id/truck_idx, same as this code does.
-            parts    = data.split(":")
-            order_id = parts[1]
-
-            with LOAD_STORE_LOCK:
-                load = LOAD_STORE.get(order_id)
-            if not load:
-                continue
-
-            all_trucks     = load.get("all_trucks", [])
-            presser_id     = (cq.get("from") or {}).get("id")
-            origin_chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
-
-            def _send_phone_popup_prompt(order_id, url):
-                prompt_text = f"💰 Order #{order_id} — tap below to enter your rate:"
-                keyboard = {"inline_keyboard": [[{"text": "💵 Enter price", "web_app": {"url": url}}]]}
-                if presser_id and _telegram_send_one(presser_id, {"text": prompt_text, "reply_markup": keyboard}):
-                    return
-                if origin_chat_id:
-                    _telegram_send_one(origin_chat_id, {"text": f"{prompt_text}\n{url}"})
-
-            if len(parts) > 2:
-                # Driver already selected (group fallback)
-                truck_idx = int(parts[2])
-                if truck_idx >= len(all_trucks):
-                    continue
-                url = _phone_bid_popup_url(order_id, truck_idx)
-                if not url:
-                    send_to_telegram(f"⚠️ Could not open the price page for Order #{order_id} — contact support.")
-                    continue
-                _send_phone_popup_prompt(order_id, url)
-
-            elif not all_trucks or len(all_trucks) == 1:
-                # Only one driver (group fallback)
-                url = _phone_bid_popup_url(order_id, None)
-                if not url:
-                    send_to_telegram(f"⚠️ Could not open the price page for Order #{order_id} — contact support.")
-                    continue
-                _send_phone_popup_prompt(order_id, url)
-
-            else:
-                # Multiple drivers — show selection. Each driver's own
-                # button is already a direct web_app popup in private
-                # chats (poller.py's own "several trucks" pattern: the
-                # driver prompt opens the price page per driver,
-                # web_app, callbacks in groups) so picking a driver is
-                # the only tap needed before the price page opens, same
-                # as the single-truck case above. Built per chat since
-                # CHAT_IDS can mix private chats and groups.
-                per_driver_urls = {i: _phone_bid_popup_url(order_id, i) for i in range(len(all_trucks))}
-
-                def _driver_select_payload(chat_id):
+                else:
+                    # Multiple drivers — show selection
                     buttons = []
                     for i, truck in enumerate(all_trucks):
                         name = truck.get("driver_name", f"Driver {i+1}")
                         dh   = truck.get("google_deadhead", "?")
-                        label = f"📱 {name}  —  {dh} mi out"
-                        url = per_driver_urls.get(i)
-                        btn = ({"text": label, "web_app": {"url": url}}
-                              if url and _web_app_ok(chat_id)
-                              else {"text": label, "callback_data": f"phone:{order_id}:{i}"})
-                        buttons.append([btn])
-                    return {"text": f"👤 Select driver for Order #{order_id} (Phone):",
-                            "reply_markup": json.dumps({"inline_keyboard": buttons})}
+                        buttons.append([{
+                            "text":          f"🚛 {name}  —  {dh} mi out",
+                            "callback_data": f"bid:{order_id}:{i}",
+                        }])
+                    send_to_telegram_with_buttons(
+                        f"👤 Select driver for Order #{order_id}:",
+                        buttons
+                    )
 
-                with _CHAT_IDS_LOCK:
-                    ids = list(CHAT_IDS)
-                if len(ids) == 1:
-                    _telegram_send_one(ids[0], _driver_select_payload(ids[0]))
-                elif ids:
-                    threads = [threading.Thread(target=_telegram_send_one,
-                                                args=(cid, _driver_select_payload(cid)), daemon=True)
-                              for cid in ids]
-                    for t in threads: t.start()
-                    for t in threads: t.join(timeout=6)
+            # ── BID PHONE ─────────────────────────────────────────────────────
+            # Changed 2026-10-07 (client, 2nd round: "when i pressed bid
+            # phone, it opened normal map on pc, it should be phone map on
+            # telegram just like in the web version") — BID PHONE is for
+            # when the dispatcher is AWAY from their PC; the native
+            # _open_bid_price_dialog (same one BID PC uses) pops up a
+            # window ON THIS MACHINE regardless of which device the
+            # dispatcher is actually holding, defeating the entire point of
+            # a separate "phone" button. Now opens the SAME bid_price.html
+            # popup (map + price) the web version's BID PHONE opens, as a
+            # Telegram web_app button sent to wherever the dispatcher
+            # pressed BID PHONE from. The server has no Gmail access for a
+            # desktop-only license, so the confirmed price relays back
+            # through THIS bot/chat (see _phone_bid_popup_url's docstring)
+            # instead of a server-side draft — the relay message is picked
+            # up below (the "message" branch of this same polling loop) and
+            # finishes the job with the exact same draft-building logic.
+            elif data.startswith("phone:"):
+                # Reaching THIS callback at all (private single-truck loads
+                # now get a direct web_app button on the original message,
+                # never a callback — see send_to_telegram's phone_url) means
+                # either a group chat (web_app doesn't work there at all —
+                # Telegram platform limit) or a multi-truck load that still
+                # needs a driver picked first. Either way: fall back to
+                # DMing the presser their own popup, and if THAT fails too
+                # (never messaged the bot privately — same 403 rule the
+                # driver bot's own popup hit), a plain link in the chat the
+                # card lives in. No pending-callback bookkeeping needed —
+                # the relay handler below re-derives load/selected from
+                # LOAD_STORE by order_id/truck_idx, same as this code does.
+                parts    = data.split(":")
+                order_id = parts[1]
 
-        # ── DRAFT TEXT ────────────────────────────────────────────────────
-        elif data.startswith("text:"):
-            parts    = data.split(":")
-            order_id = parts[1]
-
-            with LOAD_STORE_LOCK:
-                load = LOAD_STORE.get(order_id)
-            if not load:
-                continue
-
-            all_trucks = load.get("all_trucks", [])
-
-            if len(parts) > 2:
-                truck_idx = int(parts[2])
-                if truck_idx >= len(all_trucks):
+                with LOAD_STORE_LOCK:
+                    load = LOAD_STORE.get(order_id)
+                if not load:
                     continue
-                selected = all_trucks[truck_idx]
-                body = _build_bid_body_for_load(load, selected)
-                if body:
-                    _bid_id = _record_bid(load, "draft", selected)
-                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
-                    # now fills in automatically via thread learning instead)
-                    send_to_telegram(f"📋 ORDER #{order_id} — {selected['driver_name']}:\n\n{body}")
 
-            elif not all_trucks or len(all_trucks) == 1:
-                body = _build_bid_body_for_order(order_id)
-                if body:
-                    _bid_id = _record_bid(load, "draft")
-                    # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
-                    # now fills in automatically via thread learning instead)
-                    send_to_telegram(f"📋 ORDER #{order_id}:\n\n{body}")
+                all_trucks     = load.get("all_trucks", [])
+                presser_id     = (cq.get("from") or {}).get("id")
+                origin_chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
 
-            else:
-                # Multiple drivers — show selection
-                buttons = []
-                for i, truck in enumerate(all_trucks):
-                    name = truck.get("driver_name", f"Driver {i+1}")
-                    dh   = truck.get("google_deadhead", "?")
-                    buttons.append([{
-                        "text":          f"📋 {name}  —  {dh} mi out",
-                        "callback_data": f"text:{order_id}:{i}",
-                    }])
-                send_to_telegram_with_buttons(
-                    f"👤 Select driver for Order #{order_id} (Draft):",
-                    buttons
-                )
+                def _send_phone_popup_prompt(order_id, url):
+                    prompt_text = f"💰 Order #{order_id} — tap below to enter your rate:"
+                    keyboard = {"inline_keyboard": [[{"text": "💵 Enter price", "web_app": {"url": url}}]]}
+                    if presser_id and _telegram_send_one(presser_id, {"text": prompt_text, "reply_markup": keyboard}):
+                        return
+                    if origin_chat_id:
+                        _telegram_send_one(origin_chat_id, {"text": f"{prompt_text}\n{url}"})
 
-        # ── OPEN URL ──────────────────────────────────────────────────────
-        elif data.startswith("openurl:"):
-            key = data[len("openurl:"):]
-            url = _retrieve_url(key)
-            if url:
-                webbrowser.open(url)
+                if len(parts) > 2:
+                    # Driver already selected (group fallback)
+                    truck_idx = int(parts[2])
+                    if truck_idx >= len(all_trucks):
+                        continue
+                    url = _phone_bid_popup_url(order_id, truck_idx)
+                    if not url:
+                        send_to_telegram(f"⚠️ Could not open the price page for Order #{order_id} — contact support.")
+                        continue
+                    _send_phone_popup_prompt(order_id, url)
 
-        # ── REPLY ─────────────────────────────────────────────────────────
-        elif data.startswith("reply:"):
-            msg_id = data.split(":", 1)[1]
-            try:
-                full = service.users().messages().get(
-                    userId="me", id=msg_id, format="full"
-                ).execute()
-                webbrowser.open(build_gmail_thread_url(full["threadId"]))
-                send_to_telegram("📨 Reply thread opened.")
-            except HttpError as e:
-                if e.resp.status == 404:
-                    send_to_telegram("⚠️ Email not found (may have been deleted).")
+                elif not all_trucks or len(all_trucks) == 1:
+                    # Only one driver (group fallback)
+                    url = _phone_bid_popup_url(order_id, None)
+                    if not url:
+                        send_to_telegram(f"⚠️ Could not open the price page for Order #{order_id} — contact support.")
+                        continue
+                    _send_phone_popup_prompt(order_id, url)
+
                 else:
+                    # Multiple drivers — show selection. Each driver's own
+                    # button is already a direct web_app popup in private
+                    # chats (poller.py's own "several trucks" pattern: the
+                    # driver prompt opens the price page per driver,
+                    # web_app, callbacks in groups) so picking a driver is
+                    # the only tap needed before the price page opens, same
+                    # as the single-truck case above. Built per chat since
+                    # CHAT_IDS can mix private chats and groups.
+                    per_driver_urls = {i: _phone_bid_popup_url(order_id, i) for i in range(len(all_trucks))}
+
+                    def _driver_select_payload(chat_id):
+                        buttons = []
+                        for i, truck in enumerate(all_trucks):
+                            name = truck.get("driver_name", f"Driver {i+1}")
+                            dh   = truck.get("google_deadhead", "?")
+                            label = f"📱 {name}  —  {dh} mi out"
+                            url = per_driver_urls.get(i)
+                            btn = ({"text": label, "web_app": {"url": url}}
+                                  if url and _web_app_ok(chat_id)
+                                  else {"text": label, "callback_data": f"phone:{order_id}:{i}"})
+                            buttons.append([btn])
+                        return {"text": f"👤 Select driver for Order #{order_id} (Phone):",
+                                "reply_markup": json.dumps({"inline_keyboard": buttons})}
+
+                    with _CHAT_IDS_LOCK:
+                        ids = list(CHAT_IDS)
+                    if len(ids) == 1:
+                        _telegram_send_one(ids[0], _driver_select_payload(ids[0]))
+                    elif ids:
+                        threads = [threading.Thread(target=_telegram_send_one,
+                                                    args=(cid, _driver_select_payload(cid)), daemon=True)
+                                  for cid in ids]
+                        for t in threads: t.start()
+                        for t in threads: t.join(timeout=6)
+
+            # ── DRAFT TEXT ────────────────────────────────────────────────────
+            elif data.startswith("text:"):
+                parts    = data.split(":")
+                order_id = parts[1]
+
+                with LOAD_STORE_LOCK:
+                    load = LOAD_STORE.get(order_id)
+                if not load:
+                    continue
+
+                all_trucks = load.get("all_trucks", [])
+
+                if len(parts) > 2:
+                    truck_idx = int(parts[2])
+                    if truck_idx >= len(all_trucks):
+                        continue
+                    selected = all_trucks[truck_idx]
+                    body = _build_bid_body_for_load(load, selected)
+                    if body:
+                        _bid_id = _record_bid(load, "draft", selected)
+                        # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                        # now fills in automatically via thread learning instead)
+                        send_to_telegram(f"📋 ORDER #{order_id} — {selected['driver_name']}:\n\n{body}")
+
+                elif not all_trucks or len(all_trucks) == 1:
+                    body = _build_bid_body_for_order(order_id)
+                    if body:
+                        _bid_id = _record_bid(load, "draft")
+                        # (ForceReply rate-prompt removed 2026-09-09 — bid_amount
+                        # now fills in automatically via thread learning instead)
+                        send_to_telegram(f"📋 ORDER #{order_id}:\n\n{body}")
+
+                else:
+                    # Multiple drivers — show selection
+                    buttons = []
+                    for i, truck in enumerate(all_trucks):
+                        name = truck.get("driver_name", f"Driver {i+1}")
+                        dh   = truck.get("google_deadhead", "?")
+                        buttons.append([{
+                            "text":          f"📋 {name}  —  {dh} mi out",
+                            "callback_data": f"text:{order_id}:{i}",
+                        }])
+                    send_to_telegram_with_buttons(
+                        f"👤 Select driver for Order #{order_id} (Draft):",
+                        buttons
+                    )
+
+            # ── OPEN URL ──────────────────────────────────────────────────────
+            elif data.startswith("openurl:"):
+                key = data[len("openurl:"):]
+                url = _retrieve_url(key)
+                if url:
+                    webbrowser.open(url)
+
+            # ── REPLY ─────────────────────────────────────────────────────────
+            elif data.startswith("reply:"):
+                msg_id = data.split(":", 1)[1]
+                try:
+                    full = service.users().messages().get(
+                        userId="me", id=msg_id, format="full"
+                    ).execute()
+                    webbrowser.open(build_gmail_thread_url(full["threadId"]))
+                    send_to_telegram("📨 Reply thread opened.")
+                except HttpError as e:
+                    if e.resp.status == 404:
+                        send_to_telegram("⚠️ Email not found (may have been deleted).")
+                    else:
+                        print("Reply callback failed:", e)
+                except Exception as e:
                     print("Reply callback failed:", e)
-            except Exception as e:
-                print("Reply callback failed:", e)
+        except Exception as e:
+            # Durable (print() goes nowhere in this console-disabled
+            # build — _flog is the only channel that reliably survives
+            # to plutus_bot.log). Full traceback, not just str(e): this
+            # is the backstop for whatever's NOT already caught by a
+            # more specific try/except further down (e.g. the "Phone
+            # callback failed" one) — knowing exactly where it broke
+            # matters here, since this update is now unrecoverable
+            # (TELEGRAM_UPDATE_OFFSET already moved past it).
+            _flog("error", f"[CB] update handling error: {e}\n{traceback.format_exc()}")
+
 
 
 def _build_bid_body_for_load(load: dict, truck: dict,
