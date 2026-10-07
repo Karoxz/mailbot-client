@@ -9,7 +9,7 @@ from api_client import (call_parse, call_build_bid, call_poll_push,
                          call_set_thread_learning, call_get_thread_learning_status,
                          call_backfill_thread,
                          call_get_telegram_status, call_set_telegram_enabled,
-                         call_route_map, call_phone_bid_popup_url)
+                         call_route_map, call_phone_bid_popup_url, call_poll_phone_bid_relay)
 
 import sys
 import io
@@ -1836,16 +1836,12 @@ def run_thread_learning_backfill(days_back: int = 45) -> dict:
 def _phone_bid_popup_url(order_id: str, truck_idx=None):
     """Signed bid_price.html popup link for the dispatcher's own BID
     PHONE — the desktop can't mint the signed token itself (map_token's
-    secret never leaves the server), so it asks for one here, handing
-    over this machine's OWN BOT_TOKEN/CHAT_IDS so the eventual
-    confirmed price relays back through THIS bot/chat (see
-    api_client.call_phone_bid_popup_url's docstring)."""
+    secret never leaves the server), so it asks for one here. The
+    confirmed price comes back via _phone_bid_relay_poll_loop's HTTP
+    poll, not a Telegram message — see call_poll_phone_bid_relay's
+    docstring for why."""
     try:
-        with _CHAT_IDS_LOCK:
-            ids = list(CHAT_IDS)
-        return call_phone_bid_popup_url(
-            ACTIVE_LICENSE_KEY, _get_machine_id(), order_id,
-            dispatcher_bot_token=BOT_TOKEN, dispatcher_chat_ids=ids, truck=truck_idx)
+        return call_phone_bid_popup_url(ACTIVE_LICENSE_KEY, _get_machine_id(), order_id, truck=truck_idx)
     except Exception as e:
         print(f"_phone_bid_popup_url failed: {e}")
         return None
@@ -1885,34 +1881,55 @@ def _make_phone_confirm(service, load, order_id, selected):
     return _on_confirm
 
 
-def _parse_phone_bid_relay(text: str):
-    """Parses the "##PHONEBID## order truck price rate" marker message
-    /api/web/bid_price/submit relays back (main.py's method=phone +
-    desktop_relay branch) — "-" means that field was absent. Returns
-    (order_id, truck_idx_or_None, price, rate_or_None) or None."""
-    if not text or not text.startswith("##PHONEBID## "):
-        return None
-    parts = text[len("##PHONEBID## "):].split()
-    if len(parts) != 4:
-        return None
-    order_id, truck_raw, price_raw, rate_raw = parts
+def _apply_phone_bid_relay(service, order_id, truck_idx, price, rate):
+    """Finishes a BID PHONE popup submission once its confirmed price
+    has been picked up (see _phone_bid_relay_poll_loop) — looks up
+    load/selected from LOAD_STORE fresh by order_id/truck_idx (same as
+    a live "phone:" callback would) and runs the same draft-building
+    logic _make_phone_confirm already has."""
+    _flog("info", f"[PHONEBID] relay received: order={order_id} truck={truck_idx} price={price} rate={rate}")
     try:
-        price = float(price_raw)
-    except ValueError:
-        return None
-    truck_idx = None
-    if truck_raw != "-":
+        with LOAD_STORE_LOCK:
+            load = LOAD_STORE.get(order_id)
+        if not load:
+            _flog("warning", f"[PHONEBID] order={order_id} — load no longer in "
+                            f"LOAD_STORE (restarted since?) — ignored")
+            return
+        trucks = load.get("all_trucks", [])
+        selected = trucks[truck_idx] if truck_idx is not None and truck_idx < len(trucks) else None
+        _make_phone_confirm(service, load, order_id, selected)(price, rate)
+        _flog("info", f"[PHONEBID] order={order_id} — draft handling completed")
+    except Exception as e:
+        _flog("error", f"[PHONEBID] order={order_id} failed: {e}\n{traceback.format_exc()}")
+
+
+def _phone_bid_relay_poll_loop(get_service):
+    """BID PHONE's own poll loop (2026-10-07) — separate from, and much
+    slower than, the Telegram callback loop (every 3s here vs every
+    0.1s there): a bot's own sendMessage never generates an incoming
+    update for that SAME bot's getUpdates (Telegram updates represent
+    events directed AT the bot, never its own outgoing sends), found
+    live 2026-10-07 after the "##PHONEBID##" marker message this used
+    to read back was confirmed sent (visible in Telegram) but NEVER
+    once seen by this app's own getUpdates loop, across every rebuild.
+    Polls the server directly over HTTP instead — see
+    call_poll_phone_bid_relay's docstring. get_service() returns
+    whatever Gmail service object the draft should be created with;
+    called fresh each tick, same object handle_bid_callbacks' own
+    _cb_loop already uses."""
+    while not STOP_EVENT.is_set():
         try:
-            truck_idx = int(truck_raw)
-        except ValueError:
-            pass
-    rate = None
-    if rate_raw != "-":
-        try:
-            rate = float(rate_raw)
-        except ValueError:
-            pass
-    return order_id, truck_idx, price, rate
+            key, mid = ACTIVE_LICENSE_KEY, _get_machine_id()
+            if key:
+                items = call_poll_phone_bid_relay(key, mid)
+                if items:
+                    svc = get_service()
+                    for item in items:
+                        _apply_phone_bid_relay(svc, item["order_id"], item["truck_idx"],
+                                               item["price"], item["rate"])
+        except Exception as e:
+            _flog("error", f"[PHONEBID] poll loop error: {e}\n{traceback.format_exc()}")
+        time.sleep(3)
 
 
 # =============================================================
@@ -1929,36 +1946,11 @@ def handle_bid_callbacks(service):
             TELEGRAM_UPDATE_OFFSET = new_offset
 
     for upd in updates:
-        # Plain (non-callback) messages — e.g. a dispatcher typing in the
-        # chat — nothing to do with them since the ForceReply rate-prompt
-        # flow was removed (2026-09-09), EXCEPT the one new kind BID
-        # PHONE's popup relay sends back (2026-10-07, see
-        # _parse_phone_bid_relay's docstring): the server can't create
-        # the Gmail draft itself for a desktop-only license, so it
-        # relays the confirmed price back as a message on this same
-        # bot/chat instead of a callback_query.
-        msg = upd.get("message")
-        if msg and not upd.get("callback_query"):
-            relay = _parse_phone_bid_relay((msg.get("text") or "").strip())
-            if relay:
-                r_order_id, r_truck_idx, r_price, r_rate = relay
-                _flog("info", f"[PHONEBID] relay received: order={r_order_id} "
-                              f"truck={r_truck_idx} price={r_price} rate={r_rate}")
-                try:
-                    with LOAD_STORE_LOCK:
-                        r_load = LOAD_STORE.get(r_order_id)
-                    if not r_load:
-                        _flog("warning", f"[PHONEBID] order={r_order_id} — load no longer in "
-                                        f"LOAD_STORE (restarted since?) — ignored")
-                    else:
-                        r_trucks = r_load.get("all_trucks", [])
-                        r_selected = (r_trucks[r_truck_idx]
-                                     if r_truck_idx is not None and r_truck_idx < len(r_trucks) else None)
-                        _make_phone_confirm(service, r_load, r_order_id, r_selected)(r_price, r_rate)
-                        _flog("info", f"[PHONEBID] order={r_order_id} — draft handling completed")
-                except Exception as e:
-                    _flog("error", f"[PHONEBID] order={r_order_id} failed: {e}\n{traceback.format_exc()}")
-            continue
+        # Plain (non-callback) messages — e.g. a dispatcher typing in
+        # the chat — nothing to do with them; the ForceReply rate-
+        # prompt flow was removed 2026-09-09, and BID PHONE's confirmed
+        # price arrives via _phone_bid_relay_poll_loop's HTTP poll, not
+        # a Telegram message of any kind (see that function's docstring).
         if not upd.get("callback_query"):
             continue
 
@@ -2348,6 +2340,11 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
 
     cb_thread = threading.Thread(target=_cb_loop, daemon=True, name="callbacks")
     cb_thread.start()
+
+    phone_relay_thread = threading.Thread(
+        target=_phone_bid_relay_poll_loop, args=(_make_service,),
+        daemon=True, name="phone-bid-relay")
+    phone_relay_thread.start()
 
     # ── Service pool ────────────────────────────────────────────────────
     # Raised from 5 -> 12 on 2026-09-16, then 12 -> 20 on 2026-09-17 —

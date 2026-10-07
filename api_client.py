@@ -80,25 +80,18 @@ def call_driver_bid_popup_url(license_key, machine_id, order_id, driver_name,
         print(f"call_driver_bid_popup_url error: {e}")
     return None
 
-def call_phone_bid_popup_url(license_key, machine_id, order_id,
-                              dispatcher_bot_token="", dispatcher_chat_ids=None,
-                              truck=None) -> Optional[str]:
+def call_phone_bid_popup_url(license_key, machine_id, order_id, truck=None) -> Optional[str]:
     """Dispatcher's own BID PHONE (2026-10-07, client: "when i pressed
     bid phone, it opened normal map on pc, it should be phone map on
     telegram just like in the web version") — asks the server for a
     signed bid_price.html link for the DISPATCHER'S OWN bid (no
     driver_name). The server has no Gmail access for a desktop-only
     license (that's a LOCAL OAuth token on this machine, never
-    uploaded), so dispatcher_bot_token/dispatcher_chat_ids (this
-    machine's own BOT_TOKEN/CHAT_IDS) ride along so the eventual
-    confirmed price relays back through THIS bot/chat instead of a
-    server-side Gmail draft — see map_token.make_bid_token's
-    desktop_relay and main.py's /api/phone_bid_popup_url."""
+    uploaded); the confirmed price is picked up via call_poll_phone_bid_
+    relay instead — see that function's docstring for why this is a
+    poll, not a Telegram message."""
     try:
-        payload = {"license_key": license_key, "machine_id": machine_id,
-                  "order_id": order_id,
-                  "dispatcher_bot_token": dispatcher_bot_token,
-                  "dispatcher_chat_ids": dispatcher_chat_ids or []}
+        payload = {"license_key": license_key, "machine_id": machine_id, "order_id": order_id}
         if truck is not None:
             payload["truck"] = truck
         r = _session.post(f"{SERVER_URL}/api/phone_bid_popup_url", json=payload, timeout=8)
@@ -109,6 +102,28 @@ def call_phone_bid_popup_url(license_key, machine_id, order_id,
     except Exception as e:
         print(f"call_phone_bid_popup_url error: {e}")
     return None
+
+
+def call_poll_phone_bid_relay(license_key, machine_id) -> list:
+    """Polls for BID PHONE prices confirmed via the popup since the
+    last call (phone_relay_store, server-side) — a bot's own sendMessage
+    never generates an incoming update for that SAME bot's getUpdates
+    (Telegram updates represent events directed AT the bot, never its
+    own outgoing sends), so a Telegram message can't be the hand-back
+    channel here; this is a plain HTTP poll instead, same request/
+    response shape as the rest of this module. Returns a list of
+    {"order_id", "truck_idx", "price", "rate"} dicts, or [] on any
+    failure (never raises — called on a tight polling loop)."""
+    try:
+        r = _session.post(f"{SERVER_URL}/api/phone_bid_relay/poll",
+                          json={"license_key": license_key, "machine_id": machine_id}, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success"):
+                return data.get("items") or []
+    except Exception as e:
+        print(f"call_poll_phone_bid_relay error: {e}")
+    return []
 
 def call_route_map(license_key, machine_id, pickup_loc, delivery_loc,
                     frame_w=None, frame_h=None) -> Optional[dict]:
