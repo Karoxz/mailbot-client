@@ -175,8 +175,8 @@ def _validate_startup_files() -> list:
     return issues
 
 LOGO_PATH       = "assets/plutus_logo.ico"
-LOGO_DARK_PATH  = "assets/plutus_logo_dark.jpg"
-LOGO_LIGHT_PATH = "assets/plutus_logo_light.jpg"
+LOGO_DARK_PATH  = "assets/plutus_logo_dark.png"
+LOGO_LIGHT_PATH = "assets/plutus_logo_light.png"
 PREFS_FILE    = os.path.join(_EXE_DIR, "plutus_prefs.json")
 # Add near other globals
 MC_NUMBER = "12345678"
@@ -1870,7 +1870,14 @@ def _make_phone_confirm(service, load, order_id, selected):
             return
         try:
             original_msg = load.get("original_msg_full", {})
-            draft    = create_reply_draft(service, original_msg, body)
+            # Client, 2026-10-09: "when draft is created by bid phone it
+            # doesn't include company logo for some reason" — logo_path
+            # was never passed at this one call site, even though
+            # create_reply_draft/build_bid_reply_html already fully
+            # support embedding one. LOGO_LIGHT_PATH (white background)
+            # since the draft is read in a normal email client, not this
+            # app's own dark theme.
+            draft    = create_reply_draft(service, original_msg, body, LOGO_LIGHT_PATH)
             draft_id = draft.get("id", "")
             _bid_id  = _record_bid(load, "phone", selected, bid_amount=price)
             _send_phone_draft_result(order_id, draft_id, price, rate,
@@ -1932,6 +1939,33 @@ def _phone_bid_relay_poll_loop(get_service):
         time.sleep(3)
 
 
+_recent_bid_actions = {}  # callback_query data string -> last-handled time.monotonic()
+_RECENT_ACTION_COOLDOWN_S = 8
+
+
+def _is_duplicate_bid_action(data: str) -> bool:
+    """True if this exact callback data string was just handled —
+    client-reported real bug, 2026-10-09: "client pressed bid phone
+    once and it sent 3 times select the driver". Telegram inline
+    buttons never disable themselves while a slow call (minting a
+    bid_price.html popup link per driver is a real HTTP round trip) is
+    in flight, so an impatient second/third tap — or the client simply
+    retrying the send — reaches this handler as what looks like
+    several separate, individually-legitimate callback_query events,
+    each with its own distinct id but identical data. Same fix the
+    server already has for this exact bug class (poller.py's
+    _is_duplicate_bid_action) — desktop just never got it."""
+    now = time.monotonic()
+    last = _recent_bid_actions.get(data)
+    _recent_bid_actions[data] = now
+    if len(_recent_bid_actions) > 2000:  # cheap unbounded-growth guard
+        cutoff = now - 120
+        for k, v in list(_recent_bid_actions.items()):
+            if v < cutoff:
+                del _recent_bid_actions[k]
+    return last is not None and (now - last) < _RECENT_ACTION_COOLDOWN_S
+
+
 # =============================================================
 # TELEGRAM CALLBACK HANDLER — identical to original
 # =============================================================
@@ -1961,6 +1995,9 @@ def handle_bid_callbacks(service):
             data = cq.get("data", "")
             cqid = cq.get("id")
             answer_callback_query(cqid, "")
+
+            if data and _is_duplicate_bid_action(data):
+                continue
 
             # ── BID PC ────────────────────────────────────────────────────────
             if data.startswith("bid:"):
@@ -2524,7 +2561,21 @@ def main_loop(poll_seconds, allowed_vehicles, radius,
             # already-labeled thread.
             _thread_id_full = full.get("threadId", "")
             _is_reply_subject = _subj_check.strip().startswith(("RE:", "FW:", "FWD:"))
-            _is_freight = (not _is_reply_subject) and any(m in _subj_check for m in FREIGHT_MARKERS)
+            # Real bug, client-reported 2026-10-09 ("RE message wasn't
+            # processed... in both web and desktop versions") — same
+            # bug class as the 2026-09-23 fix above, one layer deeper:
+            # that fix assumed a genuine reply's Subject HEADER always
+            # carries "RE:"/"FW:"/"FWD:", but that's not guaranteed —
+            # some mail clients/relays omit it even though the message
+            # is structurally a reply within an existing thread.
+            # In-Reply-To/References are standard headers (RFC 5322)
+            # set on every genuine reply regardless of subject text —
+            # a signal subject text can't fake or omit.
+            _has_reply_headers = any(
+                _h.get("name", "").lower() in ("in-reply-to", "references") and _h.get("value", "").strip()
+                for _h in full.get("payload", {}).get("headers", []))
+            _is_freight = (not _is_reply_subject) and (not _has_reply_headers) \
+                and any(m in _subj_check for m in FREIGHT_MARKERS)
             if not _is_freight and _thread_id_full:
                 _tl2, _ts2 = _get_thread_info(svc, _thread_id_full, label_map)
                 if _tl2:
