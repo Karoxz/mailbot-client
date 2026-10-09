@@ -3209,7 +3209,7 @@ def create_app():
         try:
             if os.path.exists(path):
                 img = Image.open(path)
-                img.thumbnail((320, 110), _RESAMPLE_LANCZOS)
+                img.thumbnail((384, 132), _RESAMPLE_LANCZOS)
                 ph  = ImageTk.PhotoImage(img)
                 _logo_images[mode] = ph
                 return ph
